@@ -323,5 +323,43 @@ console.log('\n-- unknown methods --');
     check('unimplemented method returns 405 with Allow', r.status === 405 && (r.headers.get('Allow') ?? '').includes('PROPFIND'));
 }
 
+console.log('\n-- a rejected session must fail fast, not retryably --');
+{
+    // rclone's webdav retry set is {423,425,429,500,502,503,504}; 401 is absent.
+    // A dead session that surfaced as 5xx would make --retries 100 replay the
+    // whole command a hundred times, re-hashing every local byte and never
+    // progressing, so the status here is load-bearing, not cosmetic.
+    let dead = false;
+    const { call, gw } = makeServer({ sessionInvalid: () => dead });
+
+    await gw.put('/keep.txt', new Response('hello').body!, { immutable: false, size: 5, sha1: sha1('hello') });
+    check('requests succeed while the session is valid', (await call('PROPFIND', '/', { headers: { Depth: '1' } })).status === 207);
+
+    dead = true;
+    const retryable = new Set([423, 425, 429, 500, 502, 503, 504]);
+    for (const [method, path] of [
+        ['PROPFIND', '/'],
+        ['GET', '/keep.txt'],
+        ['PUT', '/new.txt'],
+        ['DELETE', '/keep.txt'],
+        ['MKCOL', '/d'],
+    ] as const) {
+        const r = await call(method, path, method === 'PROPFIND' ? { headers: { Depth: '1' } } : {});
+        check(`${method} on a rejected session returns 401`, r.status === 401, String(r.status));
+        check(`${method} status is NOT one rclone retries`, !retryable.has(r.status), String(r.status));
+    }
+
+    const body = await (await call('GET', '/keep.txt')).text();
+    check('the refusal names re-authentication as the remedy', /auth login/i.test(body), body.slice(0, 120));
+    check('the refusal says retrying will not help', /retrying will not help/i.test(body));
+
+    // Probing the endpoint must still work, or an operator cannot tell a dead
+    // session apart from a dead socket.
+    check('OPTIONS still answers so the endpoint stays discoverable', (await call('OPTIONS', '/')).status === 200);
+
+    // And a delete must not slip through the short-circuit.
+    check('no data was destroyed while refusing', (await gw.stat('/keep.txt')) !== null);
+}
+
 console.log(`\nRESULT: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

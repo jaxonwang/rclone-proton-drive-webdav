@@ -175,6 +175,17 @@ ctl /faults '{"sessionRevoked":false}'
 out copy "$T/src/after-revoke.txt" mock:/ >/dev/null
 check "recovers once the session is valid again" '[[ "$(entry /after-revoke.txt)" == file* ]]'
 
+# A revoked session must be reported as NON-retryable, or an unattended run with
+# --retries N replays the whole command N times, re-reading every source byte and
+# never progressing. 401 is deliberately outside rclone's webdav retry set.
+ctl /faults '{"sessionRevoked":true}'
+printf hello > "$T/src/revoke-retry.txt"
+RETRY_OUT=$("${R[@]}" copy "$T/src" mock:/retrydest --checksum --immutable --transfers 1 --retries 5 --low-level-retries 2 2>&1 || true)
+check "the revoked session surfaces as 401" 'echo "$RETRY_OUT" | grep -q "401"'
+check "rclone did NOT replay the command (no second attempt)" '! echo "$RETRY_OUT" | grep -qE "Attempt 2/5|Attempt 3/5"'
+check "nothing was written while revoked" '[[ "$(entry /retrydest/revoke-retry.txt)" != file* ]]'
+ctl /faults '{"sessionRevoked":false}'
+
 # ---- 7. service restart --------------------------------------------------
 echo
 echo "== 7. service restart =="

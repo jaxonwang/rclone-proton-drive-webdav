@@ -12,9 +12,9 @@
  * keyring, and permission hygiene.
  */
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import os, { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { ApiClient } from 'proton-drive-sdk-account';
@@ -24,6 +24,8 @@ import {
     acquireSessionOwnership,
     ensurePrivateDirectory,
     OwnedFileSessionStore,
+    pruneOrphanTempFiles,
+    SESSION_FILENAME,
     SessionOwnershipError,
     writePrivateFileAtomic,
 } from '../src/service/sessionStore';
@@ -130,6 +132,53 @@ console.log('\n-- single-writer ownership --');
     const release3 = await acquireSessionOwnership(dir, silentLogger);
     check('malformed lock is treated as stale', existsSync(path.join(dir, 'auth-session.lock')));
     await release3();
+
+    // Pid reuse after a reboot: the recorded pid IS alive (it is this very test
+    // process), but the lock was written before the current boot, so no live
+    // process can be holding it. Without the boot check this refuses forever and
+    // an unattended backup simply stops.
+    const lockPath = path.join(dir, 'auth-session.lock');
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: '1999-01-01T00:00:00.000Z' }), { mode: 0o600 });
+    const preBoot = new Date(Date.now() - (os.uptime() + 3600) * 1000);
+    utimesSync(lockPath, preBoot, preBoot);
+    const release4 = await acquireSessionOwnership(dir, silentLogger);
+    check('a lock predating this boot is stale even though its pid resolves', existsSync(lockPath));
+    await release4();
+
+    // ...and the same lock dated inside this boot must still block, or the fix
+    // would have quietly disabled the single-writer guarantee it protects.
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }), { mode: 0o600 });
+    await checkThrows(
+        'a lock from this boot with a live pid still blocks',
+        () => acquireSessionOwnership(dir, silentLogger),
+        (e) => e instanceof SessionOwnershipError,
+    );
+    rmSync(lockPath, { force: true });
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n-- credential temp files left by an interrupted write --');
+{
+    const dir = path.join(root, 'orphan-temps');
+    await ensurePrivateDirectory(dir);
+    const target = path.join(dir, SESSION_FILENAME);
+    // Shaped exactly like writePrivateFileAtomic's temp name. A power loss
+    // between create and rename leaves one of these holding a complete plaintext
+    // session, including the key password, and nothing else ever removes it.
+    const orphanA = path.join(dir, `.${SESSION_FILENAME}.4242.aaaaaaaa-1111-2222-3333-444444444444.tmp`);
+    const orphanB = path.join(dir, `.${SESSION_FILENAME}.99.bbbbbbbb-5555-6666-7777-888888888888.tmp`);
+    const unrelated = path.join(dir, 'cache-crypto.sqlite');
+    writeFileSync(orphanA, JSON.stringify(SYNTHETIC), { mode: 0o600 });
+    writeFileSync(orphanB, JSON.stringify(SYNTHETIC), { mode: 0o600 });
+    writeFileSync(unrelated, 'not a temp file', { mode: 0o600 });
+    writeFileSync(target, JSON.stringify(SYNTHETIC), { mode: 0o600 });
+
+    const removed = await pruneOrphanTempFiles(target, silentLogger);
+    check('both orphaned temp files are removed', removed === 2, String(removed));
+    check('no credential temp file survives', readdirSync(dir).filter((f) => f.endsWith('.tmp')).length === 0, readdirSync(dir).join(','));
+    check('the real session file is untouched', existsSync(target));
+    check('unrelated files are left alone', existsSync(unrelated));
+    check('pruning an absent directory is not an error', (await pruneOrphanTempFiles(path.join(root, 'no-such-dir', SESSION_FILENAME), silentLogger)) === 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +432,75 @@ console.log('\n-- refuses to run alongside another Proton client --');
     check('the other client\'s events.lock was left untouched', JSON.parse(readFileSync(path.join(dir, 'events.lock'), 'utf8')).pid === process.pid);
     check('no stale session lock left behind after the refusal', !existsSync(path.join(dir, 'auth-session.lock')), readdirSync(dir).join(','));
     check('the session file was not modified', JSON.parse(readFileSync(path.join(dir, 'auth-session.json'), 'utf8')).session.accessToken === SYNTHETIC.session.accessToken);
+}
+
+console.log('\n-- reboot leftovers must not brick an unattended start --');
+{
+    const spawnService = (dir: string) =>
+        new Promise<{ code: number | null; out: string }>((resolve) => {
+            const child = spawn(process.execPath, ['run', 'src/service/serve.ts'], {
+                cwd: path.join(import.meta.dir, '..'),
+                env: {
+                    ...process.env,
+                    PROTON_DRIVE_CACHE_DIR: dir,
+                    PROTON_DRIVE_CREDENTIALS_STORE: 'unsafe_file',
+                    PROTON_DRIVE_BASE_URL: 'localhost:9',
+                    PROTON_WEBDAV_SOCKET: path.join(dir, 'dav.sock'),
+                },
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            let out = '';
+            child.stdout.on('data', (d) => (out += d));
+            child.stderr.on('data', (d) => (out += d));
+            const timer = setTimeout(() => child.kill('SIGKILL'), 60_000);
+            child.on('exit', (code) => {
+                clearTimeout(timer);
+                resolve({ code, out });
+            });
+        });
+    // Both cases below still FAIL overall -- the API is unreachable at
+    // localhost:9 -- so each assertion is about WHY, not about success.
+    const concurrentRefusal = /another Proton client|concurrent/i;
+
+    // A power loss leaves events.lock holding this service's own old pid. After a
+    // reboot pids restart from 1, so that pid may well be live again as something
+    // unrelated, and a pid-only check then refuses every start forever.
+    {
+        const dir = path.join(root, 'preboot-events-lock');
+        mkdirSync(dir, { mode: 0o700 });
+        writeFileSync(path.join(dir, 'auth-session.json'), JSON.stringify(SYNTHETIC), { mode: 0o600 });
+        const lock = path.join(dir, 'events.lock');
+        writeFileSync(lock, JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+        const preBoot = new Date(Date.now() - (os.uptime() + 3600) * 1000);
+        utimesSync(lock, preBoot, preBoot);
+        const r = await spawnService(dir);
+        check('an events.lock predating this boot does not refuse startup', !concurrentRefusal.test(r.out), r.out.slice(0, 300));
+        // The stale file IS removed, deliberately: nothing can hold a lock written
+        // before the current boot, and leaving it would let the CLI's pid-only
+        // check refuse every subsequent start. A lock may exist again afterwards
+        // because the events provider then took its own -- but it must be a fresh
+        // one, not the pre-boot leftover.
+        const after = existsSync(lock) ? statSync(lock) : null;
+        check(
+            'the pre-boot leftover is gone (any lock present now belongs to this boot)',
+            after === null || after.mtimeMs > Date.now() - os.uptime() * 1000,
+            after ? `mtime ${new Date(after.mtimeMs).toISOString()}` : 'absent',
+        );
+    }
+
+    // A truncated clientUid-rclone.json used to throw a SyntaxError, which has no
+    // .code, so the "not ENOENT" rethrow refused to start the service at all.
+    {
+        const dir = path.join(root, 'broken-clientuid');
+        mkdirSync(dir, { mode: 0o700 });
+        writeFileSync(path.join(dir, 'auth-session.json'), JSON.stringify(SYNTHETIC), { mode: 0o600 });
+        writeFileSync(path.join(dir, 'clientUid-rclone.json'), '{"clientUid": "external-dri', { mode: 0o600 });
+        const r = await spawnService(dir);
+        check('a truncated client-UID file does not abort startup with a parse error', !/SyntaxError|JSON Parse|Unexpected end of JSON/i.test(r.out), r.out.slice(0, 300));
+        const rewritten = readFileSync(path.join(dir, 'clientUid-rclone.json'), 'utf8');
+        check('the rewritten file is valid and correctly prefixed', (JSON.parse(rewritten) as { clientUid: string }).clientUid.startsWith('external-drive-rclone-'));
+        check('the client-UID file stays 0600', mode(path.join(dir, 'clientUid-rclone.json')) === 0o600);
+    }
 }
 
 console.log('\n-- unavailable keyring --');

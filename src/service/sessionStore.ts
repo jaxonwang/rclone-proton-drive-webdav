@@ -14,25 +14,32 @@
  *    mode never widens.
  *  - Directory hygiene: the state directory must be a real directory owned by
  *    us with mode 0700 (matching the CLI's unsafe_file expectations).
- *  - Quarantine instead of destroy: when the account layer signs out because
- *    the refresh token was rejected, the file is renamed to a 0600
- *    `auth-session.revoked-<timestamp>.json` rather than unlinked. The session
- *    is no longer loadable (so the service correctly reports "login required"),
- *    but a false positive (e.g. transient 4xx from an intermediary) cannot
- *    silently delete the only copy of a working session.
+ *  - Preserve instead of destroy: when the account layer signs out because a
+ *    refresh was rejected, the session file is left byte-for-byte intact and a
+ *    secret-free `auth-session.signout-<timestamp>.json` marker records why.
+ *    Sign-out fires on any 4xx except 429, which includes whatever a captive
+ *    portal, proxy or WAF injects, so it is not proof the session is dead.
+ *    Renaming the file aside was the earlier design and was worse than useless:
+ *    it minted an additional on-disk copy of `userKeyPassword` -- a valid
+ *    passphrase for the user's OpenPGP keys -- every time a false positive
+ *    fired. The session therefore stays loadable; what stops the service from
+ *    pretending it can serve requests is the sign-out latch in bootstrap.ts,
+ *    which makes every request answer 401 instead of a retryable 5xx.
  *
  * Nothing in this module logs credential values.
  *
  * Liveness is decided from the recorded pid, the same approach the official CLI
  * uses for events.lock (cli/src/events/lock.ts), so the two behave consistently.
- * The known limitation is pid reuse: if the recorded pid has been recycled by an
- * unrelated process, the lock is treated as live and acquisition is refused.
- * That fails in the safe direction (refuse to start rather than risk two
- * writers) and is resolved by deleting the stale lock file.
+ * Pid reuse is handled rather than merely documented: a lock file whose mtime
+ * predates the current boot is stale whatever its pid now resolves to, because
+ * no process survives a boot. Without that test, a reboot -- where pids are
+ * re-allocated from 1 -- can leave a lock naming a pid since taken by an
+ * unrelated daemon, refusing every start until someone deletes the file.
  */
 import { randomUUID } from 'node:crypto';
 import { closeSync, fsyncSync, openSync, writeSync } from 'node:fs';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
 import type { Logger } from '@protontech/drive-sdk';
@@ -77,6 +84,69 @@ function isProcessAlive(pid: number): boolean {
 export const CLI_EVENTS_LOCK_FILENAME = 'events.lock';
 
 /**
+ * True when `mtimeMs` predates the current boot.
+ *
+ * Lock files record a pid, and pid liveness alone cannot distinguish "still
+ * held" from "pid recycled". That distinction matters most after a reboot,
+ * which is exactly when it is least reliable: pids are re-allocated from 1, so
+ * a lock written by a service that itself started at boot has a real chance of
+ * naming a pid now occupied by an unrelated boot-time daemon. The lock then
+ * looks live forever and startup is refused until someone deletes the file by
+ * hand -- which for an unattended backup means it simply stops running.
+ *
+ * No process survives a boot, so a lock file older than the current boot cannot
+ * be held, whatever its pid now points at. This only ever makes the staleness
+ * test more accurate: it never declares a lock from this boot stale, so the
+ * single-writer guarantee is unchanged.
+ */
+function predatesBoot(mtimeMs: number): boolean {
+    // os.uptime() is seconds since boot; allow a second of slack for coarse
+    // filesystem timestamps and clock granularity.
+    const bootMs = Date.now() - os.uptime() * 1000;
+    return mtimeMs < bootMs - 1000;
+}
+
+/**
+ * Remove temp files left beside `target` by a writer that died mid-write.
+ *
+ * writePrivateFileAtomic unlinks its temp file on any in-process failure, but a
+ * power loss or SIGKILL between create and rename leaves it behind -- holding a
+ * complete plaintext copy of the session, including the key password. Nothing
+ * else ever removes it, so copies accumulate one per hard stop.
+ *
+ * Only safe to call while holding the session lock: that is what makes "no
+ * other process is writing one of these right now" true.
+ */
+export async function pruneOrphanTempFiles(target: string, logger?: Logger): Promise<number> {
+    const dir = path.dirname(target);
+    const prefix = `.${path.basename(target)}.`;
+    let removed = 0;
+    let names: string[];
+    try {
+        names = await fs.readdir(dir);
+    } catch {
+        return 0;
+    }
+    for (const name of names) {
+        if (!name.startsWith(prefix) || !name.endsWith('.tmp')) {
+            continue;
+        }
+        try {
+            await fs.unlink(path.join(dir, name));
+            removed += 1;
+        } catch {
+            // Raced with someone else's cleanup, or not ours to remove.
+        }
+    }
+    if (removed > 0) {
+        // Deliberately does not name the files: the name embeds nothing secret,
+        // but the count is all an operator needs and keeps the log terse.
+        logger?.warn(`Removed ${removed} orphaned credential temp file(s) left by an interrupted write`);
+    }
+    return removed;
+}
+
+/**
  * Returns the pid of a live process holding the CLI's events lock, or null.
  *
  * Read this BEFORE creating anything: a startup that is going to be refused must
@@ -84,14 +154,72 @@ export const CLI_EVENTS_LOCK_FILENAME = 'events.lock';
  */
 export async function findActiveProtonClient(appDir: string): Promise<number | null> {
     try {
-        const raw = await fs.readFile(path.join(appDir, CLI_EVENTS_LOCK_FILENAME), 'utf8');
+        const lockPath = path.join(appDir, CLI_EVENTS_LOCK_FILENAME);
+        const raw = await fs.readFile(lockPath, 'utf8');
         const parsed = JSON.parse(raw) as { pid?: unknown };
         const pid = typeof parsed.pid === 'number' ? parsed.pid : NaN;
-        return isProcessAlive(pid) && pid !== process.pid ? pid : null;
+        if (!isProcessAlive(pid) || pid === process.pid) {
+            return null;
+        }
+        // The official CLI records only a pid, so pid reuse after a reboot would
+        // otherwise make a dead client look permanently alive and refuse every
+        // start. Unlike the CLI's own acquire path, this check never deletes the
+        // file: it is another client's, so it is only ever read.
+        const st = await fs.stat(lockPath).catch(() => null);
+        if (st && predatesBoot(st.mtimeMs)) {
+            return null;
+        }
+        return pid;
     } catch {
         // Missing, unreadable or malformed: no evidence of an active client.
         return null;
     }
+}
+
+/**
+ * Delete the CLI's events.lock ONLY when it predates the current boot.
+ *
+ * findActiveProtonClient can tell that such a lock is stale, but the events
+ * provider that runs later is the official CLI's own code, and its lock check is
+ * pid-only (cli/src/events/lock.ts). So after a reboot that recycled the recorded
+ * pid, this service would clear its own check and still be refused by that one,
+ * with no way out but manual deletion -- which for an unattended backup means it
+ * never runs again.
+ *
+ * The condition is deliberately narrow. A lock file older than the current boot
+ * cannot be held by any live process, whatever its pid now resolves to, so this
+ * can never remove a lock a running client depends on. A lock written during this
+ * boot is left strictly alone, even if its pid looks dead -- that case is the
+ * CLI's own to resolve, and it already does.
+ */
+export async function releaseStaleEventsLock(appDir: string, logger?: Logger): Promise<boolean> {
+    const lockPath = path.join(appDir, CLI_EVENTS_LOCK_FILENAME);
+    let raw: string;
+    let st: Awaited<ReturnType<typeof fs.stat>>;
+    try {
+        raw = await fs.readFile(lockPath, 'utf8');
+        st = await fs.stat(lockPath);
+    } catch {
+        return false;
+    }
+    if (!predatesBoot(st.mtimeMs)) {
+        return false;
+    }
+    // Re-read and only remove the exact bytes judged stale, so a lock rewritten
+    // by a client starting right now is not deleted underneath it.
+    const stillSame = await fs.readFile(lockPath, 'utf8').catch(() => null);
+    if (stillSame !== raw) {
+        return false;
+    }
+    try {
+        await fs.unlink(lockPath);
+    } catch {
+        return false;
+    }
+    logger?.warn(
+        `Removed ${CLI_EVENTS_LOCK_FILENAME} left over from before the current boot; no process can still hold it.`,
+    );
+    return true;
 }
 
 /**
@@ -134,10 +262,17 @@ export async function acquireSessionOwnership(dir: string, logger: Logger): Prom
             // process silently steal the lock -- defeating the single-writer
             // guarantee it exists to provide -- and the unlink/recreate that
             // followed opened a window for a third process to slip in.
-            if (isProcessAlive(pid)) {
+            const st = await fs.stat(lockPath).catch(() => null);
+            const recycledPid = st !== null && predatesBoot(st.mtimeMs);
+            if (isProcessAlive(pid) && !recycledPid) {
                 const who = pid === process.pid ? 'This process' : `Another process (pid ${pid})`;
                 throw new SessionOwnershipError(
                     `${who} already owns the session in ${dir}. Only one process may update these credentials.`,
+                );
+            }
+            if (recycledPid && isProcessAlive(pid)) {
+                logger.warn(
+                    `Session lock predates this boot; pid ${pid} has been recycled by an unrelated process. Treating the lock as stale.`,
                 );
             }
             // Re-read immediately before unlinking and only remove the exact

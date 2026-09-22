@@ -922,8 +922,21 @@ function mapUploadError(error: unknown, path: string): GatewayError {
     }
     if (error instanceof NodeWithSameNameExistsValidationError) {
         if (error.isUnfinishedUpload) {
+            // This does NOT reliably mean the draft belongs to another client.
+            // The SDK reaches the same error when the draft IS its own but the
+            // API call deleting it failed: handleConflictError sets deleteFailed,
+            // skips the retry, and falls through to this error with
+            // isUnfinishedUpload=true (client/js/src/internal/upload/manager.ts).
+            // Upstream even logs "conflict by another client" exactly when the
+            // draft is its own. So the message must not assert ownership, and
+            // must not present the override as the first remedy: a retry clears
+            // the transient case, and granting the override for a draft that is
+            // really ours would waive a protection we did not need to waive.
             return new DraftConflictError(
-                `${path}: an unfinished upload by another client exists. Replacing it requires explicit consent (PROTON_WEBDAV_OVERRIDE_DRAFT_PATH=${path}).`,
+                `${path}: an unfinished upload blocks this name. It may be this service's own draft, ` +
+                    `if deleting it just failed transiently; retry first. ` +
+                    `Only if it persists, and the draft belongs to a different client, ` +
+                    `authorise exactly this path with PROTON_WEBDAV_OVERRIDE_DRAFT_PATH=${path}.`,
             );
         }
         return new GatewayError(`${path}: a file with this name was created concurrently`, 412);

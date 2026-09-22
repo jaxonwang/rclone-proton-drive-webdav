@@ -166,6 +166,7 @@ async function main(): Promise<void> {
                 allowOverrideDraftForPath: overridePath ? overridePath : undefined,
                 logger: log,
                 guard,
+                sessionInvalid: session.sessionInvalid,
             });
         },
         error: (err) => {

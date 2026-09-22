@@ -54,6 +54,21 @@ export interface WebdavOptions {
      * See overwriteGuard.ts. Required in production; tests may omit it.
      */
     guard?: OverwriteGuard;
+    /**
+     * Reports that Proton has definitively rejected this session, so no request
+     * can succeed until someone re-authenticates.
+     *
+     * Without this, a dead session surfaces as a generic API failure, which maps
+     * to 500/502 -- and both are in rclone's webdav retry set, while 401 is not.
+     * An unattended `rclone copy --retries 100 --checksum` would therefore replay
+     * the entire command up to a hundred times, re-reading and re-hashing every
+     * local byte on each pass, and never make progress. The realistic way to get
+     * here is a power loss during token rotation: Proton issues a new refresh
+     * token and the old one dies the moment it is used, so an interrupted write
+     * leaves a token on disk that is already spent. Startup cannot detect it,
+     * because "logged in" is decided from local fields only.
+     */
+    sessionInvalid?: () => boolean;
 }
 
 const XML_CT = 'application/xml; charset=utf-8';
@@ -142,6 +157,17 @@ export async function handleRequest(req: Request, gw: DriveGateway, opts: Webdav
     const path = normalize(decode(url.pathname));
     const method = req.method.toUpperCase();
     opts.logger?.debug(`${method} ${path}`);
+
+    // Fail fast and non-retryably once the session is known to be dead. OPTIONS
+    // is still answered so a client can probe the endpoint at all.
+    if (method !== 'OPTIONS' && opts.sessionInvalid?.()) {
+        return davResponse(
+            401,
+            'Proton rejected this session: the saved token is no longer valid. ' +
+                'Re-authenticate with the official Proton Drive CLI (`auth login`) against the same ' +
+                'data directory, then restart this service. Retrying will not help.',
+        );
+    }
 
     try {
         switch (method) {

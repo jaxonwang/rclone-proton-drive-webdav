@@ -74,6 +74,13 @@ class FakeDrive {
     failNextCompletionWith?: unknown;
     /** set to throw from the next getFileUploader call */
     failNextUploaderWith?: unknown;
+    /**
+     * Make deleting an OWN draft fail, the way a transient API error does.
+     * The real SDK then sets deleteFailed, skips its retry, and throws
+     * NodeWithSameNameExistsValidationError with isUnfinishedUpload=true, which
+     * is indistinguishable from another client's draft at the type level.
+     */
+    failDeleteDraftOnce = false;
     lastUploadMetadata?: Record<string, unknown>;
     lastUploadSignal?: AbortSignal;
     /** set to throw from the next download BEFORE any byte, leaving the writer locked as the SDK does */
@@ -228,6 +235,14 @@ class FakeDrive {
                     const isDraft = !clash.revision;
                     const ownDraft = isDraft && clash.draftClientUid === drive.clientUid;
                     const mayReplace = ownDraft || (isDraft && metadata.overrideExistingDraftByOtherClient === true);
+                    if (mayReplace && drive.failDeleteDraftOnce) {
+                        // Transient failure deleting our own draft: the SDK does
+                        // NOT retry, and reports the same error it uses for a
+                        // foreign draft. The draft must survive.
+                        drive.failDeleteDraftOnce = false;
+                        drive.calls.push(`deleteDraft-FAILED ${clash.uid}`);
+                        throw new NodeWithSameNameExistsValidationError('exists', 2500, clash.uid, true);
+                    }
                     if (mayReplace) {
                         // The real SDK deletes exactly that draft node and retries.
                         drive.calls.push(`deleteDraft ${clash.uid}`);
@@ -595,6 +610,34 @@ console.log('\n-- drafts: own recovery vs another client, consent scoping --');
 
     await status('consent for one path does not cover another', () => gw.put('/alsotheirs.bin', bodyOf('y'), { sha1: sha1(enc.encode('y')), size: 1, immutable: true, overrideOtherClientDraftForPath: '/theirs.bin' }), 409);
     check("the unrelated other-client draft survived", [...drive.nodes.values()].some((n) => n.name === 'alsotheirs.bin' && !n.revision));
+}
+
+console.log('\n-- a transient failure deleting our OWN draft must not be blamed on another client --');
+{
+    const drive = new FakeDrive('sdk-js-cli-test');
+    drive.addDraft('mine.bin', 'sdk-js-cli-test');
+    const gw = makeGateway(drive);
+    drive.failDeleteDraftOnce = true;
+
+    let err: any;
+    try {
+        await gw.put('/mine.bin', bodyOf('recovered'), { sha1: sha1(enc.encode('recovered')), size: 9, immutable: true });
+    } catch (e) {
+        err = e;
+    }
+    check('a failed own-draft delete still refuses the upload (409)', err?.httpStatus === 409, String(err?.httpStatus));
+    check('our own draft was not destroyed by the failed attempt', [...drive.nodes.values()].some((n) => n.name === 'mine.bin' && !n.revision));
+    // The whole point: the operator must not be told to waive a protection for
+    // a draft that is actually ours, on the strength of a transient error.
+    check('the message does not assert the draft belongs to another client', !/by another client|belongs to another client/i.test(String(err?.message)), String(err?.message));
+    check('the message says to retry first', /retry first/i.test(String(err?.message)));
+    check('the override is presented as conditional, not as the remedy', /only if it persists/i.test(String(err?.message)));
+    check('the override hint is still scoped to the exact path', String(err?.message).includes('PROTON_WEBDAV_OVERRIDE_DRAFT_PATH=/mine.bin'));
+
+    // And the retry it recommends must actually work once the API recovers.
+    const retried = await gw.put('/mine.bin', bodyOf('recovered'), { sha1: sha1(enc.encode('recovered')), size: 9, immutable: true });
+    check('the recommended retry recovers the own draft', retried.kind === 'created', retried.kind);
+    check('recovery used deleteDraft, never trash or bulk delete', drive.calls.some((c) => c.startsWith('deleteDraft ')) && !drive.calls.some((c) => c.startsWith('trashNodes') || c.startsWith('deleteNodes')));
 }
 
 console.log('\n-- deletion is trash, never permanent delete --');

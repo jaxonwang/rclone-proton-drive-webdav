@@ -74,7 +74,15 @@ const dav = Bun.serve({
         srv.timeout(req, 0);
         const method = req.method.toUpperCase();
         try {
-            return await handleRequest(req, gateway, { immutable, allowOverrideDraftForPath: overrideDraftPath, logger, guard });
+            return await handleRequest(req, gateway, {
+                immutable,
+                allowOverrideDraftForPath: overrideDraftPath,
+                logger,
+                guard,
+                // Same latch production uses, so the revoked-session tests exercise
+                // the real short-circuit rather than a mock-only branch.
+                sessionInvalid: () => gateway.faults.sessionRevoked,
+            });
         } finally {
             // Persist after anything that can change the tree, including a FAILED
             // upload: that is exactly when a draft is left behind.

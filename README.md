@@ -111,7 +111,7 @@ here because Proton's SHA-1 is intrinsic to the revision. So: degradation below
 git clone <this repo> proton-rclone && cd proton-rclone
 scripts/setup.sh                 # workspace/ : isolated Bun + Proton sources + this service
 cd workspace/sdk/cli
-bash tests/run-all.sh            # 324 checks, no Proton account required
+bash tests/run-all.sh            # 362 checks, no Proton account required
 ```
 
 Then authenticate once with the official CLI, and start the service against the
@@ -174,6 +174,11 @@ is a stock WebDAV remote, but they are not exercised here.
   previous one either way).
 - **Another client's unfinished upload is never touched** unless you name that
   exact path. Broad deletion or trashing is never used as draft recovery.
+- **A dead session stops the run instead of grinding.** If Proton rejects the
+  saved token, every request answers `401` with the remedy in the body. `401` is
+  deliberately outside rclone's retry set, so an unattended
+  `copy --retries 100 --checksum` stops at the first failure rather than replaying
+  the whole tree a hundred times.
 - **Deletes go to Proton's trash**, never a permanent delete.
 - **One writer.** A lock makes exactly one process the owner of credential
   updates, and the service refuses to start while another Proton client is using
@@ -311,6 +316,60 @@ other. Startup checks can only see a CLI that is already running, so a save now
 refuses to overwrite a session that changed underneath it. Do not run the official
 CLI against the same `PROTON_DRIVE_CACHE_DIR` while the service is up.
 
+### A reboot could leave the service unable to start, permanently
+
+Lock files record a pid, and pid liveness cannot distinguish "still held" from
+"pid recycled". That distinction matters most straight after a boot, which is
+exactly when it is least reliable: pids are re-allocated from 1, so a lock
+written by a service that itself started at boot has a real chance of naming a
+pid now held by an unrelated daemon. The lock then looks live forever. For the
+CLI's `events.lock` there was no escape at all except deleting the file by hand
+or disabling the concurrency protection wholesale — so an unattended backup would
+simply never run again after one bad shutdown.
+
+No process survives a boot, so a lock file older than the current boot cannot be
+held, whatever its pid resolves to now. Both locks use that test, and a lock
+written during this boot is still honoured exactly as before. The stale
+`events.lock` is removed only under that condition, which is also what the CLI's
+own acquire path does for locks it considers stale.
+
+### A power loss could leave plaintext credentials in a stray file, forever
+
+The atomic-write helper unlinks its temp file on any in-process failure, but a
+power loss between create and rename leaves it behind — holding a complete
+plaintext session, including `userKeyPassword`, which is a valid passphrase for
+the user's OpenPGP keys. Nothing ever removed it, so copies accumulated one per
+hard stop. They are now pruned at startup, after the single-writer lock is held,
+which is what makes "nobody is mid-write" true rather than hopeful.
+
+### A dead session looked like a server error, so rclone ground on it
+
+Proton rotates the refresh token on use: the new one is persisted only after the
+call returns, so a power loss in that window leaves a token on disk that is
+already spent. Startup cannot detect this, because "logged in" is decided from
+local fields alone. The service therefore started cleanly and every operation
+failed at the first refresh.
+
+That failure used to surface as `500`/`502`. Both are in rclone's webdav retry
+set; `401` is not. So `rclone copy --retries 100 --checksum` replayed the entire
+command a hundred times, re-reading and re-hashing every source byte on each
+pass, and never progressed. A sign-out latch now makes every subsequent request
+answer `401` naming re-authentication as the remedy, and rclone stops after one
+attempt. Verified end to end: rclone logs `Attempt 1/1` and gives up.
+
+### An error message invited waiving a protection that was not the problem
+
+When the SDK hits a name held by an unfinished upload it deletes its own draft
+and retries. If that delete fails — a transient API error is enough — it skips
+the retry and raises the same error it uses for *another client's* draft. The
+service mapped that to a `409` asserting the draft belonged to another client and
+naming `PROTON_WEBDAV_OVERRIDE_DRAFT_PATH` as the fix. Following that advice
+would grant a standing override for a draft that was ours all along, on the
+strength of a transient failure. Upstream compounds it by logging "conflict by
+another client" precisely when the draft *is* its own. The message now states
+that it may be our own draft, puts retrying first, and makes the override
+conditional.
+
 ### Smaller ones
 
 - A single-writer lock that exempted its own PID would steal its own lock; the
@@ -339,15 +398,15 @@ Network failures are injected inside an in-memory gateway.
 ```
 $ bash tests/run-all.sh
   typecheck clean
-SUITE: webdav-protocol  RESULT: 82 passed, 0 failed
-SUITE: sdk-gateway      RESULT: 97 passed, 0 failed
-SUITE: session          RESULT: 60 passed, 0 failed
-SUITE: rclone-smoke     RESULT: 20 passed, 0 failed
-SUITE: rclone-faults    RESULT: 26 passed, 0 failed
-SUITE: rclone-mount     RESULT: 15 passed, 0 failed
-SUITE: wire             RESULT:  8 passed, 0 failed
-SUITE: reboot-resume    RESULT: 16 passed, 0 failed
-TOTAL: 324 passed, 0 failed across 8 suites
+SUITE: webdav-protocol  RESULT:  97 passed, 0 failed
+SUITE: sdk-gateway      RESULT: 105 passed, 0 failed
+SUITE: session          RESULT:  72 passed, 0 failed
+SUITE: rclone-smoke     RESULT:  20 passed, 0 failed
+SUITE: rclone-faults    RESULT:  29 passed, 0 failed
+SUITE: rclone-mount     RESULT:  15 passed, 0 failed
+SUITE: wire             RESULT:   8 passed, 0 failed
+SUITE: reboot-resume    RESULT:  16 passed, 0 failed
+TOTAL: 362 passed, 0 failed across 8 suites
 ```
 
 | Suite | What it drives |

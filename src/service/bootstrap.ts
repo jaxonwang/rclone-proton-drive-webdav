@@ -9,12 +9,18 @@
  *  2. The account API client is returned so the service can answer quota
  *     queries (`/core/v4/users`) that the Drive SDK itself does not expose.
  *
- * Client identity: the same `clientUidPrefix` as the official CLI is used so
- * the existing `clientUid.json` is reused. The SDK relies on this UID to
- * recognise the client's own unfinished uploads (drafts) and recover them; a
- * different UID would orphan every draft the CLI left behind. Application
- * identity (`x-pm-appversion`) is separate and set honestly to
- * `external-drive-rclone@...` as required by Proton's SDK usage guidelines.
+ * Client identity: this service uses its OWN client UID, prefixed
+ * `external-drive-rclone` and persisted in its own `clientUid-rclone.json`. It
+ * never reads or writes the CLI's `clientUid.json`. That separation is
+ * deliberate: the SDK uses this UID to decide which unfinished uploads (drafts)
+ * are its own and may be deleted and replaced without asking. Sharing the CLI's
+ * UID would therefore let this service silently destroy drafts belonging to a
+ * live CLI upload. The cost of the separation is that the CLI's drafts are
+ * foreign to us, so recovering one needs explicit per-path authorisation --
+ * which is the intended direction to fail. The UID must survive reboots: losing
+ * it turns our own leftover drafts into foreign ones. Application identity
+ * (`x-pm-appversion`) is separate and set honestly to `external-drive-rclone@...`
+ * as required by Proton's SDK usage guidelines.
  */
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
@@ -37,10 +43,13 @@ import { Manager, NoEventsProvider, PersistedEventsProvider } from '../events';
 import { disableSentry, initTelemetry } from '../telemetry';
 import {
     acquireSessionOwnership,
+    pruneOrphanTempFiles,
     CLI_EVENTS_LOCK_FILENAME,
     ensurePrivateDirectory,
     findActiveProtonClient,
     OwnedFileSessionStore,
+    releaseStaleEventsLock,
+    SESSION_FILENAME,
     writePrivateFileAtomic,
 } from './sessionStore';
 
@@ -107,6 +116,13 @@ export async function bootstrapService(initOptions: InitConfig) {
     // startup has to be inert: it must not leave a single file behind in a data
     // directory that belongs to a running client.
     const activeClientPid = await findActiveProtonClient(config.appDir);
+    if (activeClientPid === null) {
+        // No active client. If a lock file is nonetheless sitting there from
+        // before this boot, remove it now: the events provider opened later runs
+        // the CLI's own pid-only check, which would refuse on a recycled pid and
+        // leave no way to start without manual intervention.
+        await releaseStaleEventsLock(config.appDir);
+    }
     if (activeClientPid !== null && process.env.PROTON_WEBDAV_ALLOW_CONCURRENT_CLIENT !== '1') {
         throw new ConcurrentClientError(
             `Another Proton Drive client (pid ${activeClientPid}) is using ${config.appDir} right now ` +
@@ -138,7 +154,10 @@ export async function bootstrapService(initOptions: InitConfig) {
         }
         throw error;
     };
-    const credentialsStore = createCredentialsStore(config, logger);
+    let sessionRejected = false;
+    const credentialsStore = withSignOutLatch(createCredentialsStore(config, logger), () => {
+        sessionRejected = true;
+    });
     const credentials = new Credentials(credentialsStore, logger);
 
     CryptoApi.init({});
@@ -222,6 +241,8 @@ export async function bootstrapService(initOptions: InitConfig) {
         paths,
         eventsManager,
         clientUid,
+        /** True once Proton has rejected this session; see withSignOutLatch. */
+        sessionInvalid: () => sessionRejected,
         dispose: async () => {
             await Promise.allSettled([flushTelemetry(), eventsManager.dispose()]);
             await releaseOwnership();
@@ -235,17 +256,39 @@ export async function bootstrapService(initOptions: InitConfig) {
  */
 async function getOrGenerateServiceClientUid(appDir: string, logger: Logger): Promise<string> {
     const file = path.join(appDir, SERVICE_CLIENT_UID_FILE);
+    let raw: string | null = null;
     try {
-        const parsed = JSON.parse(await readFile(file, 'utf8')) as { clientUid?: unknown };
-        if (typeof parsed.clientUid === 'string' && parsed.clientUid.startsWith(`${CLIENT_UID_PREFIX}-`)) {
-            logger.debug(`Using existing service client UID`);
-            return parsed.clientUid;
-        }
-        logger.warn(`Ignoring malformed ${SERVICE_CLIENT_UID_FILE}; generating a new client UID`);
+        raw = await readFile(file, 'utf8');
     } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
             throw error;
         }
+    }
+    if (raw !== null) {
+        // Parse failures must not be fatal. A JSON SyntaxError carries no .code,
+        // so rethrowing on "not ENOENT" refused to start the service at all for
+        // a file a power loss had truncated -- turning a recoverable identity
+        // problem into a total outage of an unattended backup.
+        let parsed: { clientUid?: unknown } | null = null;
+        try {
+            parsed = JSON.parse(raw) as { clientUid?: unknown };
+        } catch {
+            parsed = null;
+        }
+        if (typeof parsed?.clientUid === 'string' && parsed.clientUid.startsWith(`${CLIENT_UID_PREFIX}-`)) {
+            logger.debug(`Using existing service client UID`);
+            return parsed.clientUid;
+        }
+        // Generating a new UID is the safe direction but not free: any unfinished
+        // upload left by the previous identity stops being recognisable as ours,
+        // so it becomes another client's draft and its path is refused until
+        // explicitly authorised. Say so, rather than letting it surface later as
+        // an unexplained 409.
+        logger.warn(
+            `${SERVICE_CLIENT_UID_FILE} is unreadable or malformed; generating a new client UID. ` +
+                `Any unfinished upload from the previous identity will now be treated as another client's draft ` +
+                `and refused until authorised for that exact path.`,
+        );
     }
     const clientUid = `${CLIENT_UID_PREFIX}-${randomUUID()}`;
     await writePrivateFileAtomic(file, `${JSON.stringify({ clientUid }, null, 2)}\n`);
@@ -266,7 +309,36 @@ async function getOrGenerateServiceClientUid(appDir: string, logger: Logger): Pr
  */
 async function acquireCredentialStoreOwnership(config: Config, logger: Logger): Promise<() => Promise<void>> {
     await ensurePrivateDirectory(config.appDir, logger);
-    return acquireSessionOwnership(config.appDir, logger);
+    const release = await acquireSessionOwnership(config.appDir, logger);
+    // Only now that we hold the lock is it safe to assert that no other process
+    // is part-way through writing a session temp file, which is what makes
+    // removing leftovers from an interrupted write correct rather than a race.
+    // Those leftovers hold a full plaintext copy of the session.
+    await pruneOrphanTempFiles(path.join(config.appDir, SESSION_FILENAME), logger);
+    return release;
+}
+
+/**
+ * Wrap a credentials store so a sign-out is observable to the HTTP layer.
+ *
+ * The account module calls remove() when Proton rejects a token refresh. The
+ * store deliberately keeps the session file (the trigger fires on any 4xx except
+ * 429, which includes transient portal responses), but the service still has to
+ * stop pretending it can serve requests: otherwise every operation returns a
+ * retryable 5xx and an unattended rclone run burns a hundred passes over the
+ * whole source tree. Latching here rather than in one store covers keychain,
+ * pass and file alike.
+ */
+function withSignOutLatch(inner: CredentialsStore, onSignOut: () => void): CredentialsStore {
+    return {
+        ...inner,
+        load: () => inner.load(),
+        save: (snapshot) => inner.save(snapshot),
+        remove: async () => {
+            onSignOut();
+            await inner.remove();
+        },
+    } as CredentialsStore;
 }
 
 function createCredentialsStore(config: Config, logger: Logger): CredentialsStore {
