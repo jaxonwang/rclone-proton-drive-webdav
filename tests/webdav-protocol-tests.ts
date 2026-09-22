@@ -162,6 +162,15 @@ console.log('\n-- PUT --');
     const zeroBack = await call('GET', '/zero.bin');
     check('zero-byte file reads back as empty', zeroBack.status === 200 && (await zeroBack.text()) === '');
 
+    // A body-less PUT is only an empty file when the client SAID zero bytes.
+    // Substituting an empty payload for a missing body would otherwise store a
+    // nonempty source as empty -- the "Upload file empty" failure shape.
+    const lying = await call('PUT', '/lying.bin', { headers: { 'Content-Length': '1048576' } });
+    check('body-less PUT declaring a nonzero size is refused', lying.status === 409, String(lying.status));
+    check('nothing was written for the refused body-less PUT', gw.snapshot()['/lying.bin'] === undefined);
+    const noLen = await call('PUT', '/nolen.bin', {});
+    check('body-less PUT with no Content-Length is refused', noLen.status === 409, String(noLen.status));
+
     const identical = await call('PUT', '/new.txt', {
         body: 'brand new',
         headers: { 'OC-Checksum': `SHA1:${sha1('brand new')}`, 'X-OC-Mtime': '1800000000', 'Content-Length': '9' },

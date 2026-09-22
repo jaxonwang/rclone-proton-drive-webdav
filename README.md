@@ -4,6 +4,9 @@ A small local service that lets **stock rclone** talk to Proton Drive through
 Proton's **official Drive SDK**, reusing a session you have already
 authenticated with the official Proton Drive CLI.
 
+It is a long-running foreground process, not a managed daemon: it ships no
+systemd unit and does not survive logout or reboot.
+
 ```bash
 rclone copy  ~/photos protondrive-sdk:photos --immutable -P
 rclone check ~/photos protondrive-sdk:photos --checksum
@@ -90,8 +93,15 @@ chunked-upload protocol, which this service does not implement, and it avoids
 rclone's chunk-URL probe that fails against a non-Nextcloud URL layout. Expect
 one `NOTICE: Chunked uploads are disabled...` line per invocation.
 
-**Minimum rclone version: 1.68.0**, the first release containing the webdav
-`unix_socket` option.
+**rclone 1.68.0 minimum, 1.75.1 recommended.** Established by fetching
+`backend/webdav/webdav.go` at every tag from v1.62.0 to v1.75.1: `unix_socket`
+first appears in v1.68.0. Every nextcloud quirk this relies on (`hasOCSHA1`,
+`useOCMtime`, `propsetMtime`, and `nextcloud_chunk_size = 0` disabling chunking)
+is present from v1.64.0, so nothing pushes the floor higher. The
+`PATCH X-Recalculate-Hash` quirk exists *only* from v1.75.1; below that rclone
+never sends it and embeds the digest in `SetModTime` instead, which costs nothing
+here because Proton's SHA-1 is intrinsic to the revision. So: degradation below
+1.75.1, not breakage.
 
 ---
 
@@ -101,7 +111,7 @@ one `NOTICE: Chunked uploads are disabled...` line per invocation.
 git clone <this repo> proton-rclone && cd proton-rclone
 scripts/setup.sh                 # workspace/ : isolated Bun + Proton sources + this service
 cd workspace/sdk/cli
-bash tests/run-all.sh            # 283 checks, no Proton account required
+bash tests/run-all.sh            # 308 checks, no Proton account required
 ```
 
 Then authenticate once with the official CLI, and start the service against the
@@ -190,8 +200,17 @@ is a stock WebDAV remote, but they are not exercised here.
    when the revision reports no clear-text size. Reporting size `0` would make
    rclone copy such a file as empty and call it done.
 8. **SHA-1 only.** Proton has no MD5. Files whose revision carries no digest
-   expose no hash; none is ever fabricated.
-9. **No systemd unit and no auto-restart.** It does not survive reboot by design.
+   expose no hash, and none is ever fabricated. Be aware of what that means for
+   verification: `rclone check --checksum` reports such a file as matching, on
+   size alone, with exit 0. That is the same output shape as the `vendor = owncloud`
+   trap described above, so treat "0 differences" as conditional on the remote
+   actually having digests.
+9. **No systemd unit and no auto-restart.** It does not survive logout or reboot.
+   The default socket lives under `$XDG_RUNTIME_DIR`, which the system removes at
+   last logout; the process would then still be running but unreachable, so it
+   watches its own socket and exits if it disappears, releasing its locks. For an
+   unattended long-running job, either enable lingering for the user or put the
+   socket somewhere persistent.
 10. **Photos, albums, sharing and trash browsing are not exposed.** One Drive
     subtree is served.
 
@@ -239,6 +258,54 @@ signal it was created with. Five ranged reads exhausted the queue and every late
 download blocked forever, which `rclone mount` hits within seconds. Each ranged
 read now owns an `AbortController` fired on completion, error and cancellation.
 
+### Erroring a response body is not always visible to the client
+
+Measured on Bun 1.3.14 over a Unix socket: a response body that errors **before**
+its first chunk is sent as `200 OK` with a cleanly terminated empty chunked body,
+so a failed download is indistinguishable from a successful zero-byte file. Bun
+also computes its own `Content-Length` and ignores the handler's, so there is no
+header-level length contract to fall back on. Even a *late* error only resets the
+connection once output has actually been flushed; for a small body the whole
+response is buffered and still terminated cleanly.
+
+So the first byte is committed before the response exists: a read does not return
+until the transfer has produced a chunk, finished (an empty file), or failed. An
+early failure becomes a real HTTP error status; a later one truncates a response
+whose delivered length is short of the size advertised by `PROPFIND`, which is the
+comparison rclone makes. `tests/wire-tests.sh` asserts this on the socket, because
+in-process tests inspect a `Response` object and can never see framing.
+
+### A legacy revision leaked a download slot on every ranged read
+
+`getSeekableStream()` throws for revisions with no claimed block sizes — but it
+registers its abort listener *after* that check, so nothing is listening and the
+queue slot the downloader already took is held forever. Five ranged reads of such
+files block every later download. Aborting cannot fix it; the only other release
+hook is `downloadToStream`'s own `finally`, so that is driven deliberately with an
+aborted signal and a sink that refuses data, making the SDK run its cleanup.
+
+### A transient 4xx would have destroyed a valid session
+
+The account module signs out on **any** 4xx from `/auth/v4/refresh` except 429,
+with no retry because the refresh is a POST. That bucket includes 408, and
+anything a captive portal, proxy or WAF injects. Acting on it as proof the session
+is dead would end an unattended backup over a hotel Wi-Fi redirect. Sign-out now
+preserves the session file and records a secret-free marker instead.
+
+An earlier version renamed the file aside, which avoided deletion but minted a
+fresh on-disk copy of `userKeyPassword` each time — derived from the account
+password, and a valid passphrase for the user's OpenPGP keys indefinitely. So
+repeated false positives accumulated live decryption credentials in cleartext.
+
+### The official CLI can still become a second writer
+
+It takes no lock on the session file, writes it in place, and runs happily when
+its own `events.lock` is already held. Starting it *after* the service therefore
+gives two processes one rotating refresh token, and whoever loses invalidates the
+other. Startup checks can only see a CLI that is already running, so a save now
+refuses to overwrite a session that changed underneath it. Do not run the official
+CLI against the same `PROTON_DRIVE_CACHE_DIR` while the service is up.
+
 ### Smaller ones
 
 - A single-writer lock that exempted its own PID would steal its own lock; the
@@ -248,6 +315,14 @@ read now owns an `AbortController` fired on completion, error and cancellation.
   stray file.
 - A startup refused because another client was active still created files in that
   client's data directory, because the check ran after the first write.
+- A locked-but-present OS keyring can block `libsecret` on an unlock prompt no
+  background process will answer, hanging startup while holding the lock; the
+  credential load is now bounded by a timeout.
+- The upload permit the SDK takes before a transfer had no cancellation path, so a
+  disconnected client held it for the whole transfer and a queued request waited
+  with no deadline. The request's abort signal is now passed through.
+- A body-less `PUT` was treated as an empty upload even when the client declared a
+  nonzero `Content-Length`, which is how a nonempty source ends up stored as empty.
 
 ---
 
@@ -259,13 +334,14 @@ Network failures are injected inside an in-memory gateway.
 ```
 $ bash tests/run-all.sh
   typecheck clean
-SUITE: webdav-protocol  RESULT: 79 passed, 0 failed
-SUITE: sdk-gateway      RESULT: 91 passed, 0 failed
-SUITE: session          RESULT: 52 passed, 0 failed
+SUITE: webdav-protocol  RESULT: 82 passed, 0 failed
+SUITE: sdk-gateway      RESULT: 97 passed, 0 failed
+SUITE: session          RESULT: 60 passed, 0 failed
 SUITE: rclone-smoke     RESULT: 20 passed, 0 failed
 SUITE: rclone-faults    RESULT: 26 passed, 0 failed
 SUITE: rclone-mount     RESULT: 15 passed, 0 failed
-TOTAL: 283 passed, 0 failed across 6 suites
+SUITE: wire             RESULT:  8 passed, 0 failed
+TOTAL: 308 passed, 0 failed across 7 suites
 ```
 
 | Suite | What it drives |
@@ -276,6 +352,7 @@ TOTAL: 283 passed, 0 failed across 6 suites
 | `rclone-smoke.sh` | real rclone: copy, check, hashsum, ranged cat, immutability |
 | `rclone-faults.sh` | interrupted transfers, drafts, consent scoping, retries, revoked session |
 | `rclone-mount.sh` | FUSE mount: listing, reads, kernel ranged reads, writes, immutability |
+| `wire-tests.sh` | raw socket: how failures are actually framed on the wire |
 
 Covered explicitly: interrupted uploads, own-draft recovery, another client's
 draft, scoped consent, process restart, token refresh and persistence,
@@ -288,7 +365,9 @@ assertion that unmounted before rclone's writeback so the write never reached th
 server; a shared VFS cache that let a refused upload shadow the remote on a later
 run; fault injection consumed by a `PROPFIND` before reaching the `PUT`; a
 `grep -v` assertion that could never fail; a keyring test that accepted a process
-it had to `SIGKILL`; and the download double described above.
+it had to `SIGKILL`; and the download double described above. A ninth: the SDK double registered an
+abort listener on the whole-file download path that the real SDK only registers
+for seekable streams, which hid the slot leak above.
 
 ---
 

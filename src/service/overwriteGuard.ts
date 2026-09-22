@@ -22,8 +22,17 @@
  * never involved: unfinished uploads are invisible to DELETE by construction.
  */
 
-/** How long a refused path stays protected. rclone's cleanup DELETE follows its failed PUT within ~1s. */
-export const OVERWRITE_PROTECT_MS = 15_000;
+/**
+ * How long a path stays protected after a failed PUT.
+ *
+ * rclone sleeps 1s before its cleanup DELETE, so this only has to outlast that.
+ * But the delay is a wall-clock assumption, not an invariant: pacer backoff,
+ * --tpslimit queueing, or a client that only reads the error after finishing a
+ * very large body can all push the DELETE out. The cost of a generous window is
+ * that an immediate, deliberate delete of the same path is refused and has to be
+ * repeated; the cost of too short a window is destroyed data. So: generous.
+ */
+export const OVERWRITE_PROTECT_MS = 120_000;
 
 export class OverwriteGuard {
     private readonly until = new Map<string, number>();

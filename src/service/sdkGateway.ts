@@ -299,7 +299,7 @@ export class SdkGateway implements DriveGateway {
 
     // ---- read --------------------------------------------------------------
 
-    async read(path: string, range?: { start: number; end: number }): Promise<ReadResult> {
+    async read(path: string, range?: { start: number; end: number }, signal?: AbortSignal): Promise<ReadResult> {
         const node = await this.resolveOrThrow(path);
         if (node.type !== NodeType.File || !node.activeRevision) {
             throw new NotFoundError(`Not a file: ${path}`);
@@ -314,27 +314,41 @@ export class SdkGateway implements DriveGateway {
         }
 
         if (range) {
-            return this.readRange(path, node, range, totalSize);
+            return this.readRange(path, node, range, totalSize, signal);
         }
-        return this.readWhole(path, node, totalSize);
+        return this.readWhole(path, node, totalSize, signal);
     }
 
     /**
      * Whole-file read through the SDK's verified download path.
      *
-     * The SDK does NOT close the WritableStream it is handed: on success it only
-     * calls `writer.releaseLock()`, and on failure it leaves the writer locked
-     * (see internal/download/fileDownloader.ts). So the client owns the end of
-     * the stream. An earlier version used a TransformStream and relied on its
-     * `flush` to run the integrity check and end the body -- flush never fired,
-     * so the response would never have terminated and the check never run, and
-     * the failure path called `abort()` on a stream still locked by the SDK.
+     * Two runtime facts drive the shape of this, both measured rather than assumed:
      *
-     * Here the readable is driven directly: its controller is closed or errored
-     * once `completion()` settles, which is also the only point at which Proton
-     * has confirmed the whole transfer.
+     *  1. The SDK does NOT close the WritableStream it is handed. On success it
+     *     only calls `writer.releaseLock()`; on failure it leaves the writer
+     *     locked (internal/download/fileDownloader.ts). Ending the stream is the
+     *     caller's job, so the readable is driven directly from `completion()`.
+     *  2. Erroring a Bun response body is only visible to the client once bytes
+     *     have started flowing. Measured against Bun 1.3.14 over a Unix socket:
+     *     a stream that errors AFTER its first chunk resets the connection, which
+     *     a client reports as a failed transfer; a stream that errors BEFORE any
+     *     chunk yields `200 OK` with a cleanly terminated EMPTY chunked body, so
+     *     a failed download would look like a successful zero-byte file. Bun also
+     *     computes its own Content-Length and ignores the one set here, so there
+     *     is no header-level length contract to fall back on.
+     *
+     * So the first byte is committed before the response exists: this method does
+     * not resolve until the download has produced its first chunk, or has
+     * finished (an empty file), or has failed. A failure before that point
+     * becomes a real HTTP error status; a failure after it resets the connection.
+     * Either way the client cannot mistake it for success.
      */
-    private async readWhole(path: string, node: NodeEntity, totalSize: number): Promise<ReadResult> {
+    private async readWhole(
+        path: string,
+        node: NodeEntity,
+        totalSize: number,
+        signal?: AbortSignal,
+    ): Promise<ReadResult> {
         const rev = node.activeRevision!;
         const expectedSha1 = rev.claimedDigests?.sha1?.toLowerCase();
         const enforceSha1 = !!expectedSha1 && !!rev.claimedDigests?.sha1Verified;
@@ -344,6 +358,40 @@ export class SdkGateway implements DriveGateway {
         const abort = new AbortController();
         let readableController!: ReadableStreamDefaultController<Uint8Array>;
         let resumeProducer: (() => void) | null = null;
+        const wakeProducer = () => {
+            const resume = resumeProducer;
+            resumeProducer = null;
+            resume?.();
+        };
+        // Waking the parked producer on cancel matters: without it a consumer that
+        // goes away mid-stream leaves the producer blocked on backpressure, and the
+        // SDK's download-queue slot is held until the whole revision has been
+        // fetched. Five of those and every later download blocks.
+        const release = () => {
+            abort.abort();
+            wakeProducer();
+        };
+        linkAbort(signal, { abort: release } as AbortController);
+
+        // Resolves once the transfer is demonstrably underway (or legitimately
+        // finished); rejects if it fails before that.
+        let committed = false;
+        let commitResolve!: () => void;
+        let commitReject!: (error: unknown) => void;
+        const commit = new Promise<void>((resolve, reject) => {
+            commitResolve = () => {
+                if (!committed) {
+                    committed = true;
+                    resolve();
+                }
+            };
+            commitReject = (error: unknown) => {
+                if (!committed) {
+                    committed = true;
+                    reject(error);
+                }
+            };
+        });
 
         const readable = new ReadableStream<Uint8Array>(
             {
@@ -351,13 +399,10 @@ export class SdkGateway implements DriveGateway {
                     readableController = controller;
                 },
                 pull: () => {
-                    // The consumer drained some buffer: let the producer continue.
-                    const resume = resumeProducer;
-                    resumeProducer = null;
-                    resume?.();
+                    wakeProducer();
                 },
                 cancel: () => {
-                    abort.abort();
+                    release();
                 },
             },
             { highWaterMark: 8 * 1024 * 1024, size: (chunk?: Uint8Array) => chunk?.byteLength ?? 0 },
@@ -368,7 +413,9 @@ export class SdkGateway implements DriveGateway {
                 hash.update(chunk);
                 produced += chunk.byteLength;
                 readableController.enqueue(chunk);
-                // Apply backpressure instead of buffering the whole file.
+                // Commit before parking, so awaiting the first byte can never
+                // deadlock against backpressure.
+                commitResolve();
                 if ((readableController.desiredSize ?? 1) <= 0) {
                     await new Promise<void>((resolve) => {
                         resumeProducer = resolve;
@@ -384,16 +431,20 @@ export class SdkGateway implements DriveGateway {
             .then(() => {
                 const actual = hash.digest('hex');
                 if (produced !== totalSize) {
-                    readableController.error(
-                        new IntegrityFailedError(`${path}: size mismatch, got ${produced}, expected ${totalSize}`),
+                    const error = new IntegrityFailedError(
+                        `${path}: size mismatch, got ${produced}, expected ${totalSize}`,
                     );
+                    commitReject(error);
+                    readableController.error(error);
                     return;
                 }
                 if (expectedSha1 && actual !== expectedSha1) {
                     if (enforceSha1) {
-                        readableController.error(
-                            new IntegrityFailedError(`${path}: SHA-1 mismatch against verified claimed digest`),
+                        const error = new IntegrityFailedError(
+                            `${path}: SHA-1 mismatch against verified claimed digest`,
                         );
+                        commitReject(error);
+                        readableController.error(error);
                         return;
                     }
                     // Proton marks this digest unverified, so a mismatch is not
@@ -405,14 +456,20 @@ export class SdkGateway implements DriveGateway {
                             `(claimed ${expectedSha1}, got ${actual})`,
                     );
                 }
+                // An empty file produces no chunks, so this is also the commit
+                // point for a legitimately zero-byte read.
+                commitResolve();
                 readableController.close();
             })
             .catch((error: unknown) => {
-                // Erroring the body truncates the response, so the client sees a
-                // failed transfer and retries. Never close cleanly on failure.
-                readableController.error(mapGenericError(error));
+                const mapped = mapGenericError(error);
+                commitReject(mapped);
+                // Erroring the body truncates the response, so a client that has
+                // already started receiving sees a failed transfer.
+                readableController.error(mapped);
             });
 
+        await commit;
         return { stream: readable, size: totalSize, totalSize };
     }
 
@@ -425,38 +482,45 @@ export class SdkGateway implements DriveGateway {
      * signal it was created with, or stream cancellation. Without the explicit
      * abort below, five ranged reads exhaust the queue and every later download
      * blocks forever, which `rclone mount` would hit within seconds.
+     *
+     * As with readWhole, the first chunk is fetched before the response exists so
+     * that an early failure is an HTTP error rather than a clean empty body.
      */
     private async readRange(
         path: string,
         node: NodeEntity,
         range: { start: number; end: number },
         totalSize: number,
+        signal?: AbortSignal,
     ): Promise<ReadResult> {
         const start = range.start;
         const end = Math.min(range.end, Math.max(totalSize - 1, 0));
         const wanted = totalSize === 0 ? 0 : Math.max(0, end - start + 1);
 
         const abort = new AbortController();
+        linkAbort(signal, abort);
         const downloader = await this.sdk.getFileDownloader(node, abort.signal);
         let seekable;
         try {
             seekable = downloader.getSeekableStream();
-        } catch (error: unknown) {
-            // Revisions uploaded by older clients carry no claimed block sizes,
-            // so the SDK cannot seek. Release this download slot and serve the
-            // range by reading the file and discarding the rest.
+        } catch {
+            // Revisions uploaded by older clients carry no claimed block sizes, so
+            // the SDK cannot seek and getSeekableStream throws.
+            //
+            // Releasing the download slot here is not as simple as aborting: the
+            // SDK registers its abort listener INSIDE getSeekableStream, after the
+            // block-sizes check that just threw, so nothing is listening and the
+            // slot this downloader holds would be held forever. Five legacy-file
+            // ranged reads would then block every later download. The only other
+            // release hook is downloadToStream's own finally, so drive that with an
+            // already-aborted signal and a sink that cannot accept data: the SDK
+            // fails fast and runs its cleanup.
             abort.abort();
+            await forceReleaseDownloadSlot(downloader);
             this.logger.info(`${path}: seeking unsupported for this revision, falling back to a full read`);
-            return this.readRangeByFullRead(path, node, start, wanted, totalSize);
+            return this.readRangeByFullRead(path, node, start, wanted, totalSize, signal);
         }
 
-        if (wanted === 0) {
-            abort.abort();
-            return { stream: new Response(new Uint8Array()).body!, size: 0, totalSize };
-        }
-
-        let remaining = wanted;
-        let positioned = false;
         let released = false;
         const release = () => {
             if (!released) {
@@ -465,12 +529,40 @@ export class SdkGateway implements DriveGateway {
             }
         };
 
+        if (wanted === 0) {
+            release();
+            return { stream: new Response(new Uint8Array()).body!, size: 0, totalSize };
+        }
+
+        // Fetch the first chunk up front: a failure here becomes a proper error
+        // status instead of a cleanly terminated empty 200.
+        let remaining = wanted;
+        let pending: Uint8Array | null = null;
+        try {
+            await seekable.seek(start);
+            const { value } = await seekable.read(Math.min(SEEK_READ_CHUNK, remaining));
+            if (!value || value.byteLength === 0) {
+                throw new IntegrityFailedError(`${path}: no data at offset ${start}`);
+            }
+            pending = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+            remaining -= pending.byteLength;
+        } catch (error: unknown) {
+            release();
+            throw mapGenericError(error);
+        }
+
         const stream = new ReadableStream<Uint8Array>({
             pull: async (controller) => {
                 try {
-                    if (!positioned) {
-                        await seekable.seek(start);
-                        positioned = true;
+                    if (pending) {
+                        const chunk = pending;
+                        pending = null;
+                        controller.enqueue(chunk);
+                        if (remaining <= 0) {
+                            release();
+                            controller.close();
+                        }
+                        return;
                     }
                     const { value, done } = await seekable.read(Math.min(SEEK_READ_CHUNK, remaining));
                     if (value && value.byteLength > 0) {
@@ -506,8 +598,9 @@ export class SdkGateway implements DriveGateway {
         start: number,
         wanted: number,
         totalSize: number,
+        signal?: AbortSignal,
     ): Promise<ReadResult> {
-        const whole = await this.readWhole(path, node, totalSize);
+        const whole = await this.readWhole(path, node, totalSize, signal);
         const reader = whole.stream.getReader();
         let skipped = 0;
         let remaining = wanted;
@@ -622,9 +715,13 @@ export class SdkGateway implements DriveGateway {
         }
 
         try {
+            // The signal matters more than it looks: the SDK takes a concurrency
+            // permit inside these calls and waiting for one has no timeout, so
+            // without it a disconnected client can hold a permit for a whole
+            // transfer and a queued request can wait forever.
             const uploader = revisionOfUid
-                ? await this.sdk.getFileRevisionUploader(revisionOfUid, metadata)
-                : await this.sdk.getFileUploader(parent, name, metadata);
+                ? await this.sdk.getFileRevisionUploader(revisionOfUid, metadata, opts.signal)
+                : await this.sdk.getFileUploader(parent, name, metadata, opts.signal);
             const controller = await uploader.uploadFromStream(body, []);
             await controller.completion();
             this.invalidate(p);
@@ -787,6 +884,36 @@ export class SdkGateway implements DriveGateway {
     async close(): Promise<void> {
         await this.session.dispose();
     }
+}
+
+/**
+ * Make a downloader run its own cleanup so the SDK releases the download-queue
+ * slot it took. Used only when getSeekableStream() threw before the SDK had
+ * registered any release hook.
+ */
+async function forceReleaseDownloadSlot(downloader: { downloadToStream: (s: WritableStream) => { completion: () => Promise<void> } }): Promise<void> {
+    try {
+        const refuse = new WritableStream<Uint8Array>({
+            write() {
+                throw new Error('slot release: sink intentionally refuses data');
+            },
+        });
+        await downloader.downloadToStream(refuse).completion();
+    } catch {
+        // Expected: the point is the SDK's finally, not the outcome.
+    }
+}
+
+/** Mirror an incoming signal onto an internal controller, without leaking a listener. */
+function linkAbort(source: AbortSignal | undefined, target: AbortController): void {
+    if (!source) {
+        return;
+    }
+    if (source.aborted) {
+        target.abort();
+        return;
+    }
+    source.addEventListener('abort', () => target.abort(), { once: true });
 }
 
 function mapUploadError(error: unknown, path: string): GatewayError {

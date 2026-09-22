@@ -47,6 +47,17 @@ export interface PutOptions {
      * stable client UID and do not require this.
      */
     overrideOtherClientDraftForPath?: string;
+    /**
+     * Aborted when the HTTP client goes away.
+     *
+     * The SDK limits concurrent uploads with a permit taken before the transfer
+     * starts, and waiting for a permit has no timeout. Without a signal, a
+     * client that disconnects mid-upload leaves the transfer running to
+     * completion holding its permit, and a request that is merely queued waits
+     * forever with no way to cancel it. Both are the shape of stall that
+     * exhausts the queue and blocks every later upload.
+     */
+    signal?: AbortSignal;
 }
 
 export type PutResult =
@@ -134,7 +145,7 @@ export interface DriveGateway {
      * yields exactly that byte range (inclusive end). Ranged reads are used for
      * video seeking and partial fetches.
      */
-    read(path: string, range?: { start: number; end: number }): Promise<ReadResult>;
+    read(path: string, range?: { start: number; end: number }, signal?: AbortSignal): Promise<ReadResult>;
     /**
      * Upload content. Resolves ONLY after Proton confirms the revision is
      * committed. Honours immutability, own-draft recovery, and explicit

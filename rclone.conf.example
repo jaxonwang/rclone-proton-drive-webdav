@@ -8,6 +8,8 @@
 # which this service does not implement.
 #
 # Requires rclone 1.68.0 or newer (first release with webdav unix_socket).
+# Developed and tested against 1.75.1, the first release with the Nextcloud
+# PATCH X-Recalculate-Hash quirk; below that it degrades, it does not break.
 [protondrive-sdk]
 type = webdav
 url = http://localhost/

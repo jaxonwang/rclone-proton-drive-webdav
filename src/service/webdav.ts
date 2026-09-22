@@ -296,7 +296,7 @@ async function handleGet(req: Request, gw: DriveGateway, path: string, headOnly:
     }
 
     if (range !== 'none') {
-        const { stream, size, totalSize } = await gw.read(path, range);
+        const { stream, size, totalSize } = await gw.read(path, range, req.signal);
         return new Response(stream, {
             status: 206,
             headers: {
@@ -306,7 +306,7 @@ async function handleGet(req: Request, gw: DriveGateway, path: string, headOnly:
             },
         });
     }
-    const { stream, size } = await gw.read(path);
+    const { stream, size } = await gw.read(path, undefined, req.signal);
     return new Response(stream, {
         status: 200,
         headers: { ...commonHeaders, 'Content-Length': String(size) },
@@ -327,22 +327,43 @@ function parseOcChecksum(header: string | null): string | undefined {
 }
 
 async function handlePut(req: Request, gw: DriveGateway, path: string, opts: WebdavOptions): Promise<Response> {
-    // A zero-length PUT has no body stream. Rejecting it would make empty files
-    // impossible to upload AND would trigger rclone's cleanup DELETE on the
-    // target, so treat it as what it is: an empty payload.
-    const body = req.body ?? new Response(new Uint8Array()).body!;
     const mtimeHeader = req.headers.get('X-OC-Mtime');
     const mtime = mtimeHeader ? new Date(parseInt(mtimeHeader, 10) * 1000) : undefined;
     const sha1 = parseOcChecksum(req.headers.get('OC-Checksum'));
     const lenHeader = req.headers.get('Content-Length');
-    const size = lenHeader ? parseInt(lenHeader, 10) : undefined;
+    const size = lenHeader !== null ? parseInt(lenHeader, 10) : undefined;
+    const declaredSize = size !== undefined && !Number.isNaN(size) ? size : undefined;
+
+    // A zero-length PUT has no body stream at all. Substituting an empty payload
+    // is correct ONLY when the client actually declared zero bytes; doing it
+    // whenever the body is absent would silently write an empty file over a real
+    // one, which is how a nonempty source ends up stored as empty.
+    if (!req.body && declaredSize !== 0) {
+        throw new ConflictError(
+            declaredSize === undefined
+                ? 'PUT has no body and no Content-Length; refusing to guess an empty upload'
+                : `PUT declared ${declaredSize} bytes but carried no body`,
+        );
+    }
+    const body = req.body ?? new Response(new Uint8Array()).body!;
+    if (declaredSize === undefined) {
+        // expectedSize:null makes the SDK skip its exact byte-count check. rclone
+        // always sets Content-Length for this vendor (PutStream is disabled), so
+        // this is unexpected and worth saying out loud rather than quietly
+        // accepting weaker verification.
+        opts.logger?.warn(
+            `PUT ${path} has no usable Content-Length; uploading without an exact size check ` +
+                `(the SHA-1 check still applies when OC-Checksum is present)`,
+        );
+    }
 
     const putOpts: PutOptions = {
-        size: size !== undefined && !Number.isNaN(size) ? size : undefined,
+        size: declaredSize,
         sha1,
         mtime,
         immutable: opts.immutable,
         overrideOtherClientDraftForPath: opts.allowOverrideDraftForPath,
+        signal: req.signal,
     };
 
     let result;

@@ -51,6 +51,11 @@ export class SessionDirectoryUnsafeError extends Error {
     name = 'SessionDirectoryUnsafeError';
 }
 
+/** Another process rewrote the session file while this one held it. */
+export class SessionConflictError extends Error {
+    name = 'SessionConflictError';
+}
+
 function isProcessAlive(pid: number): boolean {
     if (!Number.isInteger(pid) || pid <= 0) {
         return false;
@@ -191,7 +196,17 @@ export async function writePrivateFileAtomic(target: string, data: string): Prom
     try {
         const fd = openSync(tmp, 'wx', 0o600);
         try {
-            writeSync(fd, data);
+            // writeSync may write fewer bytes than requested; a silent short write
+            // would leave a truncated session that parses as "logged out".
+            const bytes = Buffer.from(data, 'utf8');
+            let written = 0;
+            while (written < bytes.byteLength) {
+                const n = writeSync(fd, bytes, written, bytes.byteLength - written);
+                if (n <= 0) {
+                    throw new Error(`Short write persisting ${target}: ${written}/${bytes.byteLength} bytes`);
+                }
+                written += n;
+            }
             fsyncSync(fd);
         } finally {
             closeSync(fd);
@@ -216,12 +231,43 @@ export async function writePrivateFileAtomic(target: string, data: string): Prom
 
 export class OwnedFileSessionStore implements CredentialsStore {
     private readonly filePath: string;
+    /**
+     * Identity of the session file as this process last saw it.
+     *
+     * The official CLI does not take auth-session.lock, writes the file in place
+     * and non-atomically, and runs happily even when events.lock is already held
+     * (it just loses event subscriptions). So a `proton-drive` command started
+     * AFTER this service is a second refresher of the same rotating token, and
+     * the startup events.lock check cannot detect that ordering. Recording the
+     * file identity lets a save notice it is about to overwrite someone else's
+     * newer tokens, and refuse.
+     */
+    private lastSeen?: { ino: number; mtimeMs: number; size: number };
 
     constructor(
         private readonly dir: string,
         private readonly logger: Logger,
     ) {
         this.filePath = path.join(dir, SESSION_FILENAME);
+    }
+
+    private async currentIdentity(): Promise<{ ino: number; mtimeMs: number; size: number } | null> {
+        try {
+            const st = await fs.lstat(this.filePath);
+            return { ino: Number(st.ino), mtimeMs: st.mtimeMs, size: st.size };
+        } catch {
+            return null;
+        }
+    }
+
+    private sameIdentity(
+        a: { ino: number; mtimeMs: number; size: number } | null | undefined,
+        b: { ino: number; mtimeMs: number; size: number } | null | undefined,
+    ): boolean {
+        if (!a || !b) {
+            return a === b || (!a && !b);
+        }
+        return a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size;
     }
 
     async load(): Promise<CredentialsSnapshot | null> {
@@ -246,6 +292,7 @@ export class OwnedFileSessionStore implements CredentialsStore {
             throw new SessionDirectoryUnsafeError('Session file is unexpectedly large');
         }
         const raw = await fs.readFile(this.filePath, 'utf8');
+        this.lastSeen = await this.currentIdentity() ?? undefined;
         const parsed = parseStoredSnapshot(raw);
         if (!parsed) {
             this.logger.warn('Stored session is present but not parseable; treating as logged out');
@@ -254,40 +301,92 @@ export class OwnedFileSessionStore implements CredentialsStore {
     }
 
     async save(snapshot: CredentialsSnapshot): Promise<void> {
+        const current = await this.currentIdentity();
+        if (this.lastSeen && current && !this.sameIdentity(this.lastSeen, current)) {
+            // Someone else rewrote the session since we read it. Proton rotates
+            // the refresh token on use, so overwriting would leave that writer
+            // holding a token we just invalidated -- and would discard the newer
+            // one. Refuse; the caller surfaces the failure.
+            throw new SessionConflictError(
+                `${this.filePath} changed on disk since this process read it: another Proton client is ` +
+                    `writing the same session. Refusing to overwrite it. Stop the other client (do not run ` +
+                    `the official CLI against the same PROTON_DRIVE_CACHE_DIR while this service is up).`,
+            );
+        }
         this.logger.debug('Persisting updated session');
         await writePrivateFileAtomic(this.filePath, JSON.stringify(snapshot));
+        this.lastSeen = await this.currentIdentity() ?? undefined;
     }
 
     /**
-     * Called by the account layer on sign-out, including when a token refresh
-     * is definitively rejected. Quarantine (rename, keep 0600) instead of
-     * deleting so a working session cannot be lost to a false alarm.
+     * Called by the account layer on sign-out, including when a token refresh is
+     * rejected. It does NOT delete or move the session file.
+     *
+     * The account module signs out on ANY 4xx from /auth/v4/refresh except 429
+     * (incubating/account/js/src/apiClient.ts), with no retry, because the refresh
+     * is a POST. That bucket includes 408, 403, 404 and anything a captive portal,
+     * proxy or WAF injects. Treating one such response as proof the session is
+     * dead would destroy a perfectly good session and stop an unattended backup
+     * for the night.
+     *
+     * Earlier versions renamed the file aside. That avoided outright deletion but
+     * minted a fresh on-disk copy of `userKeyPassword` every time, which is
+     * derived from the account password and stays a valid passphrase for the
+     * user's OpenPGP keys indefinitely -- so repeated false positives accumulated
+     * live decryption credentials in cleartext.
+     *
+     * So: keep the session exactly where it is, record a secret-free marker that a
+     * sign-out happened, and say so loudly. If the session really is revoked, the
+     * next attempt fails again and the operator re-runs `auth login`, which
+     * overwrites the file. If it was a transient 4xx, nothing was lost.
      */
     async remove(): Promise<void> {
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const quarantined = path.join(this.dir, `auth-session.revoked-${stamp}.json`);
+        const marker = path.join(this.dir, `auth-session.signout-${stamp}.json`);
+        let uidHint = 'unknown';
         try {
-            await fs.rename(this.filePath, quarantined);
-            await fs.chmod(quarantined, 0o600);
-            this.logger.warn(`Session invalidated; moved aside to ${path.basename(quarantined)}. Re-run 'auth login' to continue.`);
-            await this.pruneQuarantined();
-        } catch (error: unknown) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-                throw error;
+            const snapshot = await this.load();
+            if (snapshot) {
+                // First 6 characters only: enough to correlate, not a credential.
+                uidHint = `${snapshot.session.uid.slice(0, 6)}...`;
             }
+        } catch {
+            // Best effort only; the marker matters more than the hint.
         }
+        try {
+            await writePrivateFileAtomic(
+                marker,
+                JSON.stringify(
+                    {
+                        at: new Date().toISOString(),
+                        sessionUidPrefix: uidHint,
+                        note:
+                            'The account layer signed out, usually a rejected token refresh. The session ' +
+                            'file was intentionally NOT deleted: the sign-out fires on any 4xx except 429, ' +
+                            'which includes transient proxy and portal responses. Re-run `auth login` if ' +
+                            'this persists. This marker holds no credentials.',
+                    },
+                    null,
+                    2,
+                ) + '\n',
+            );
+            await this.pruneMarkers();
+        } catch (error: unknown) {
+            this.logger.warn(`Could not record a sign-out marker: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        this.logger.error(
+            `Session signed out by the account layer (session ${uidHint}). The session file was PRESERVED, ` +
+                `because this fires on any 4xx from the refresh endpoint including transient ones. ` +
+                `If Proton really revoked it, re-run 'auth login'.`,
+        );
     }
 
-    /**
-     * Keep only the newest few quarantined sessions. Each one holds long-lived
-     * key material in plaintext, so an unbounded pile of them is a growing
-     * exposure rather than a useful safety net.
-     */
-    private async pruneQuarantined(): Promise<void> {
-        const keep = 3;
+    /** Keep only the newest few sign-out markers. They hold no secrets, just noise. */
+    private async pruneMarkers(): Promise<void> {
+        const keep = 5;
         try {
             const names = (await fs.readdir(this.dir))
-                .filter((n) => n.startsWith('auth-session.revoked-'))
+                .filter((n) => n.startsWith('auth-session.signout-'))
                 .sort();
             for (const name of names.slice(0, Math.max(0, names.length - keep))) {
                 await fs.unlink(path.join(this.dir, name)).catch(() => {});

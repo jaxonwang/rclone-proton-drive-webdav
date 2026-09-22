@@ -149,7 +149,10 @@ export class MockGateway implements DriveGateway {
         return out;
     }
 
-    async read(path: string, range?: { start: number; end: number }): Promise<ReadResult> {
+    async read(path: string, range?: { start: number; end: number }, signal?: AbortSignal): Promise<ReadResult> {
+        if (signal?.aborted) {
+            throw new GatewayError('Client went away', 499);
+        }
         const p = normalize(path);
         this.tick('read', p);
         const node = this.lookup(p);
@@ -160,17 +163,37 @@ export class MockGateway implements DriveGateway {
         const start = range ? range.start : 0;
         const end = range ? Math.min(range.end, total - 1) : total - 1;
         const slice = node.data.subarray(start, end + 1);
-        const drop = this.faults.dropGetAfterBytes;
+        // `null` arrives from JSON when a test clears the fault, and `null <= 0`
+        // is true in JS, so narrow to a real number before comparing.
+        const rawDrop = this.faults.dropGetAfterBytes;
+        const drop = typeof rawDrop === 'number' ? rawDrop : undefined;
         this.faults.dropGetAfterBytes = undefined;
+
+        // Mirror the real gateway's failure timing, because the timing is what
+        // decides whether a client can see the failure at all. Measured on Bun:
+        // a body that errors before its first chunk is sent as a cleanly
+        // terminated empty 200, so an early failure must be raised BEFORE the
+        // response exists; a failure after the first chunk resets the connection.
+        if (drop !== undefined && drop <= 0) {
+            throw new GatewayError('Simulated failure before any data was sent', 502);
+        }
+
+        let offset = 0;
+        const limit = drop !== undefined && drop < slice.byteLength ? drop : slice.byteLength;
         const stream = new ReadableStream<Uint8Array>({
-            start(controller) {
-                if (drop !== undefined && drop < slice.byteLength) {
-                    controller.enqueue(slice.subarray(0, drop));
-                    controller.error(new Error('Simulated connection drop during download'));
+            pull: (controller) => {
+                if (offset >= limit) {
+                    if (limit < slice.byteLength) {
+                        // Truncated on purpose: error AFTER data has flowed.
+                        controller.error(new Error('Simulated connection drop during download'));
+                    } else {
+                        controller.close();
+                    }
                     return;
                 }
-                controller.enqueue(slice);
-                controller.close();
+                const chunk = slice.subarray(offset, Math.min(offset + 65536, limit));
+                offset += chunk.byteLength;
+                controller.enqueue(chunk);
             },
         });
         return { stream, size: slice.byteLength, totalSize: total };

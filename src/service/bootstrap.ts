@@ -68,6 +68,25 @@ const SERVICE_CLIENT_UID_FILE = 'clientUid-rclone.json';
 
 export type ServiceSession = Awaited<ReturnType<typeof bootstrapService>>;
 
+/** How long to wait for the credentials store before giving up (locked keyring). */
+const CREDENTIAL_LOAD_TIMEOUT_MS = 20_000;
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => reject(new Error(message)), ms);
+            }),
+        ]);
+    } finally {
+        if (timer) {
+            clearTimeout(timer);
+        }
+    }
+}
+
 /** Raised when another Proton Drive client is already active on the data directory. */
 export class ConcurrentClientError extends Error {
     name = 'ConcurrentClientError';
@@ -111,7 +130,9 @@ export async function bootstrapService(initOptions: InitConfig) {
 
     const releaseOwnership = await acquireCredentialStoreOwnership(config, logger);
     let started = false;
-    const abortStartup = async (error: unknown) => {
+    // Any failure after the lock is taken must hand it back, or a failed start
+    // leaves a lock the next run has to guess about.
+    const abortStartup = async (error: unknown): Promise<never> => {
         if (!started) {
             await releaseOwnership().catch(() => {});
         }
@@ -124,7 +145,17 @@ export async function bootstrapService(initOptions: InitConfig) {
     CryptoProxy.setEndpoint(new CryptoApi(), (endpoint) => endpoint.clearKeyStore());
     const openPGPCryptoModule = new OpenPGPCryptoWithCryptoProxy(CryptoProxy);
 
-    const { auth, addresses, srp, httpClient, apiClient } = await initApi(config, credentials, logger, CryptoProxy);
+    // initApi loads the session, which for the keychain store goes through
+    // libsecret. A present-but-LOCKED keyring can block on an unlock prompt that
+    // no background service will ever answer, so startup would hang forever
+    // holding the lock instead of failing with something actionable.
+    const { auth, addresses, srp, httpClient, apiClient } = await withTimeout(
+        initApi(config, credentials, logger, CryptoProxy),
+        CREDENTIAL_LOAD_TIMEOUT_MS,
+        `Timed out after ${CREDENTIAL_LOAD_TIMEOUT_MS / 1000}s loading credentials from the ` +
+            `'${config.credentialsStore}' store. If it is the OS keyring, it is probably locked and ` +
+            `waiting for an interactive unlock: unlock it, or use a store that does not prompt.`,
+    ).catch(abortStartup);
 
     const clientUid = await getOrGenerateServiceClientUid(config.appDir, logger);
     const caches = createCaches(config, credentials, logger);

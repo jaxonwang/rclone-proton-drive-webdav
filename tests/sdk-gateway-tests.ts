@@ -75,8 +75,11 @@ class FakeDrive {
     /** set to throw from the next getFileUploader call */
     failNextUploaderWith?: unknown;
     lastUploadMetadata?: Record<string, unknown>;
-    /** set to throw from the next download, leaving the writer locked as the SDK does */
+    lastUploadSignal?: AbortSignal;
+    /** set to throw from the next download BEFORE any byte, leaving the writer locked as the SDK does */
     failNextDownloadWith?: unknown;
+    /** set to fail the next download AFTER this many bytes have been written */
+    failDownloadAfterBytes?: number;
     /** revisions (by name) that have no claimedBlockSizes, so seeking is impossible */
     readonly noBlockSizesFor = new Set<string>();
     /** how many SDK download-queue slots are currently held (real limit is 5) */
@@ -210,9 +213,10 @@ class FakeDrive {
                 }
                 return drive.entity(drive.addFolder(name, parentUid));
             },
-            async getFileUploader(parent: unknown, name: string, metadata: Record<string, unknown>) {
+            async getFileUploader(parent: unknown, name: string, metadata: Record<string, unknown>, signal?: AbortSignal) {
                 drive.calls.push(`getFileUploader ${name}`);
                 drive.lastUploadMetadata = metadata;
+                drive.lastUploadSignal = signal;
                 if (drive.failNextUploaderWith !== undefined) {
                     const e = drive.failNextUploaderWith;
                     drive.failNextUploaderWith = undefined;
@@ -234,10 +238,11 @@ class FakeDrive {
                 }
                 return drive.makeUploader(parentUid, name, metadata, undefined);
             },
-            async getFileRevisionUploader(nodeUid: unknown, metadata: Record<string, unknown>) {
+            async getFileRevisionUploader(nodeUid: unknown, metadata: Record<string, unknown>, signal?: AbortSignal) {
                 const uid = drive.uidOf(nodeUid);
                 drive.calls.push(`getFileRevisionUploader ${uid}`);
                 drive.lastUploadMetadata = metadata;
+                drive.lastUploadSignal = signal;
                 const existing = drive.nodes.get(uid)!;
                 return drive.makeUploader(existing.parentUid!, existing.name, metadata, uid);
             },
@@ -364,7 +369,10 @@ class FakeDrive {
                 drive.openDownloadSlots -= 1;
             }
         };
-        signal?.addEventListener('abort', releaseSlot, { once: true });
+        // NOTE: the real SDK registers an abort listener ONLY inside
+        // getSeekableStream. downloadToStream instead releases in its own finally.
+        // Registering it here for both would hide a whole-file slot leak, so the
+        // listener is attached below, in getSeekableStream only.
 
         return {
             getClaimedSizeInBytes: () => n.revision?.size,
@@ -375,9 +383,20 @@ class FakeDrive {
                         if (drive.failNextDownloadWith !== undefined) {
                             const e = drive.failNextDownloadWith;
                             drive.failNextDownloadWith = undefined;
-                            throw e; // writer intentionally left locked
+                            throw e; // before any byte; writer intentionally left locked
                         }
-                        await writer.write(content);
+                        const failAfter = drive.failDownloadAfterBytes;
+                        drive.failDownloadAfterBytes = undefined;
+                        if (failAfter !== undefined && failAfter < content.byteLength) {
+                            // Write some bytes, then fail: the mid-transfer case.
+                            await writer.write(content.subarray(0, failAfter));
+                            throw new ServerError('proton dropped the connection mid-transfer');
+                        }
+                        // Several chunks, so backpressure actually engages.
+                        const CHUNK = 64 * 1024;
+                        for (let off = 0; off < content.byteLength; off += CHUNK) {
+                            await writer.write(content.subarray(off, Math.min(off + CHUNK, content.byteLength)));
+                        }
                         writer.releaseLock(); // released, but NOT closed
                     } finally {
                         releaseSlot();
@@ -394,6 +413,9 @@ class FakeDrive {
                 if (drive.noBlockSizesFor.has(n.name)) {
                     throw new Error('Revision does not have defined claimed block sizes');
                 }
+                // Matches the real SDK: the seekable path has no terminal hook, so
+                // the abort signal is its only release.
+                signal?.addEventListener('abort', releaseSlot, { once: true });
                 let pos = 0;
                 return {
                     seek(p: number) {
@@ -432,6 +454,9 @@ function makeGateway(drive: FakeDrive, warnings: string[] = []) {
     };
     return new SdkGateway(session as never, { rootPath: '/my-files' });
 }
+
+/** Let queued microtasks and timers run: slot release is asynchronous. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
 
 async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
     const reader = stream.getReader();
@@ -663,24 +688,69 @@ console.log('\n-- reads: full and ranged --');
     const fallbackBytes = await drain(fallback.stream);
     check('ranged read falls back to a full read when seeking is unsupported', fallbackBytes.byteLength === 100, String(fallbackBytes.byteLength));
     check('fallback returns the correct bytes', fallbackBytes[0] === payload[500] && fallbackBytes[99] === payload[599]);
+    await settle();
     check('fallback leaks no download slots', drive.openDownloadSlots === 0, `slots=${drive.openDownloadSlots}`);
     drive.noBlockSizesFor.delete('blob.bin');
 
-    // A mid-transfer failure must error the body, not hang and not close cleanly.
+    // Failure BEFORE the first byte must surface as an error from read() itself.
+    // Erroring the body instead would be invisible: the runtime sends a cleanly
+    // terminated empty 200, which a client reads as a successful empty file.
     drive.failNextDownloadWith = new ServerError('proton dropped the connection');
-    const failing = await gw.read('/blob.bin');
-    let failed = false;
+    await status('failure before the first byte throws from read(), not via the body', () => gw.read('/blob.bin'), 502);
+    await settle();
+    check('slot released after a pre-first-byte failure', drive.openDownloadSlots === 0, `slots=${drive.openDownloadSlots}`);
+
+    // Failure AFTER bytes have flowed: read() succeeds, the body errors.
+    drive.failDownloadAfterBytes = 1024;
+    const partial = await gw.read('/blob.bin');
+    let bodyFailed = false;
     await Promise.race([
-        drain(failing.stream).then(
+        drain(partial.stream).then(
             () => {},
             () => {
-                failed = true;
+                bodyFailed = true;
             },
         ),
         new Promise((resolve) => setTimeout(resolve, 3000)),
     ]);
-    check('failed download errors the stream instead of hanging', failed);
-    check('failed download releases its slot', drive.openDownloadSlots === 0, `slots=${drive.openDownloadSlots}`);
+    check('mid-transfer failure errors the body instead of hanging', bodyFailed);
+    await settle();
+    check('slot released after a mid-transfer failure', drive.openDownloadSlots === 0, `slots=${drive.openDownloadSlots}`);
+
+    // Cancelling a whole-file read mid-stream must release the slot, which means
+    // waking the producer parked on backpressure rather than only aborting.
+    const midCancel = await gw.read('/blob.bin');
+    const reader = midCancel.stream.getReader();
+    await reader.read();
+    await reader.cancel();
+    await settle();
+    check('cancelling a whole-file read mid-stream releases the slot', drive.openDownloadSlots === 0, `slots=${drive.openDownloadSlots}`);
+}
+
+console.log('\n-- client disconnect releases SDK capacity --');
+{
+    // The SDK takes an upload permit before the transfer and waiting for one has
+    // no timeout, so a disconnected client must not hold it and a queued request
+    // must be cancellable. Assert the signal actually reaches the SDK.
+    const drive = new FakeDrive();
+    const gw = makeGateway(drive);
+    const ac = new AbortController();
+    await gw.put('/signalled.txt', bodyOf('hello'), { sha1: sha1(enc.encode('hello')), size: 5, immutable: true, signal: ac.signal });
+    check('the request signal is handed to the SDK uploader', drive.lastUploadSignal === ac.signal);
+
+    // A read must release its download slot when the client goes away.
+    // Larger than one seek chunk, so the up-front prefetch cannot finish the range
+    // and the slot is genuinely still held when the response is handed back.
+    const drive2 = new FakeDrive();
+    drive2.addFile('big.bin', 'x'.repeat(4 * 1024 * 1024));
+    const gw2 = makeGateway(drive2);
+    const ac2 = new AbortController();
+    const r = await gw2.read('/big.bin', { start: 0, end: 4 * 1024 * 1024 - 1 }, ac2.signal);
+    check('ranged read holds a download slot while open', drive2.openDownloadSlots === 1, `slots=${drive2.openDownloadSlots}`);
+    ac2.abort();
+    await settle();
+    check('client disconnect releases the download slot', drive2.openDownloadSlots === 0, `slots=${drive2.openDownloadSlots}`);
+    await r.stream.cancel().catch(() => {});
 }
 
 console.log('\n-- trashed nodes and unknown sizes are not served --');

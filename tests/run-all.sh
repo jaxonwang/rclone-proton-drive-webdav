@@ -55,9 +55,10 @@ run_suite session      bun run tests/session-tests.ts
 run_suite rclone-smoke bash tests/rclone-smoke.sh  "$OUT/smoke"
 run_suite rclone-faults bash tests/rclone-faults.sh "$OUT/faults"
 run_suite rclone-mount bash tests/rclone-mount.sh  "$OUT/mount"
+run_suite wire         bash tests/wire-tests.sh    "$OUT/wire"
 
 echo "=============================================================="
-echo "TOTAL: $total_pass passed, $total_fail failed across 6 suites"
+echo "TOTAL: $total_pass passed, $total_fail failed across 7 suites"
 echo "suites with a non-zero exit: $suites_failed"
 echo "logs kept in $OUT"
 echo "=============================================================="

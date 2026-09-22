@@ -258,21 +258,74 @@ console.log('\n-- expired / revoked session --');
     await credentials.load();
 
     const resp = await apiClient.authenticatedRequest.get(`${baseUrl}/drive/v2/volumes`, { throwHttpErrors: false });
-    check('revoked session surfaces as 401 (not a false success)', resp.status === 401, `status ${resp.status}`);
-    check('credentials report logged out after revocation', !credentials.isLoggedIn());
-    check('live session file is no longer present', !existsSync(path.join(dir, 'auth-session.json')));
-    const quarantined = readdirSync(dir).filter((f) => f.startsWith('auth-session.revoked-'));
-    check('revoked session is quarantined, not deleted', quarantined.length === 1, readdirSync(dir).join(','));
-    if (quarantined[0]) {
-        check('quarantined file stays owner-only 0600', mode(path.join(dir, quarantined[0])) === 0o600);
-        const kept = JSON.parse(readFileSync(path.join(dir, quarantined[0]), 'utf8')) as typeof SYNTHETIC;
-        check('quarantined copy retains the original credentials', kept.userKeyPassword === SYNTHETIC.userKeyPassword);
+    check('rejected refresh surfaces as 401 (not a false success)', resp.status === 401, `status ${resp.status}`);
+    check('credentials report logged out in memory', !credentials.isLoggedIn());
+    // The account layer signs out on ANY 4xx except 429 from the refresh endpoint,
+    // with no retry, so that signal is NOT proof the session is dead. Destroying
+    // the file on it would lose a working session to a captive-portal 403.
+    check(
+        'the session file is PRESERVED, not deleted or renamed away',
+        existsSync(path.join(dir, 'auth-session.json')),
+        readdirSync(dir).join(','),
+    );
+    const preserved = JSON.parse(readFileSync(path.join(dir, 'auth-session.json'), 'utf8')) as typeof SYNTHETIC;
+    check('the preserved session is byte-intact', preserved.session.refreshToken === SYNTHETIC.session.refreshToken);
+    check('a reload still finds the session usable', (await new OwnedFileSessionStore(dir, silentLogger as never).load()) !== null);
+
+    const markers = readdirSync(dir).filter((f) => f.startsWith('auth-session.signout-'));
+    check('a sign-out marker is recorded', markers.length === 1, readdirSync(dir).join(','));
+    if (markers[0]) {
+        check('the marker is owner-only 0600', mode(path.join(dir, markers[0])) === 0o600);
+        const raw = readFileSync(path.join(dir, markers[0]), 'utf8');
+        check('the marker carries NO credentials', !raw.includes(SYNTHETIC.userKeyPassword) && !raw.includes(SYNTHETIC.session.refreshToken) && !raw.includes(SYNTHETIC.cachePassword), raw.slice(0, 200));
+        check('the marker still identifies the session enough to correlate', raw.includes(SYNTHETIC.session.uid.slice(0, 6)));
     }
-    check('a fresh load after revocation returns null', (await new OwnedFileSessionStore(dir, silentLogger as never).load()) === null);
+    check('no revoked-style copy of the credentials was created', readdirSync(dir).filter((f) => f.startsWith('auth-session.revoked-')).length === 0);
     server.stop(true);
 }
 
 // ---------------------------------------------------------------------------
+console.log('\n-- refuses to overwrite a session another client rewrote --');
+{
+    // The official CLI takes no auth-session.lock, writes the file in place, and
+    // runs even when events.lock is held, so it can become a second refresher of
+    // the same rotating token. Overwriting its newer tokens would invalidate them.
+    const dir = path.join(root, 'foreign-writer');
+    await ensurePrivateDirectory(dir);
+    writeFileSync(path.join(dir, 'auth-session.json'), JSON.stringify(SYNTHETIC), { mode: 0o600 });
+    const store = new OwnedFileSessionStore(dir, silentLogger as never);
+    const loaded = await store.load();
+    check('session loads before the interloper writes', loaded !== null);
+
+    // Another client rotates the token underneath us.
+    const theirs = {
+        ...SYNTHETIC,
+        session: { ...SYNTHETIC.session, accessToken: 'their-fresh-access', refreshToken: 'their-fresh-refresh' },
+    };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    writeFileSync(path.join(dir, 'auth-session.json'), JSON.stringify(theirs), { mode: 0o600 });
+
+    await checkThrows(
+        'saving over a foreign write is refused',
+        () => store.save({ ...SYNTHETIC, session: { ...SYNTHETIC.session, accessToken: 'ours' } } as never),
+        (e) => e instanceof Error && e.name === 'SessionConflictError',
+    );
+    const onDisk = JSON.parse(readFileSync(path.join(dir, 'auth-session.json'), 'utf8')) as typeof SYNTHETIC;
+    check('the other client refresh token survives', onDisk.session.refreshToken === 'their-fresh-refresh');
+
+    // A save with no interference must still work.
+    const dir2 = path.join(root, 'sole-writer');
+    await ensurePrivateDirectory(dir2);
+    writeFileSync(path.join(dir2, 'auth-session.json'), JSON.stringify(SYNTHETIC), { mode: 0o600 });
+    const store2 = new OwnedFileSessionStore(dir2, silentLogger as never);
+    await store2.load();
+    await store2.save({ ...SYNTHETIC, session: { ...SYNTHETIC.session, accessToken: 'rotated' } } as never);
+    const after = JSON.parse(readFileSync(path.join(dir2, 'auth-session.json'), 'utf8')) as typeof SYNTHETIC;
+    check('an uncontended save still persists', after.session.accessToken === 'rotated');
+    await store2.save({ ...SYNTHETIC, session: { ...SYNTHETIC.session, accessToken: 'rotated-again' } } as never);
+    check('consecutive saves by the owner are allowed', JSON.parse(readFileSync(path.join(dir2, 'auth-session.json'), 'utf8')).session.accessToken === 'rotated-again');
+}
+
 console.log('\n-- refuses to run alongside another Proton client --');
 {
     // A live holder of the CLI's events.lock means another Proton Drive client is

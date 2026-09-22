@@ -187,6 +187,34 @@ async function main(): Promise<void> {
     console.log(`root=${rootPath} immutable=${immutable} override_draft_path=${overridePath ?? '(none)'}`);
     console.log(`state dir=${session.config.appDir} client_uid_prefix=${CLIENT_UID_PREFIX}`);
 
+    // If the socket disappears, this process is alive but unreachable -- and it
+    // still holds both the credential lock and the official CLI's events.lock, so
+    // the CLI would refuse to run too. That is not hypothetical: $XDG_RUNTIME_DIR
+    // is torn down on last logout while the process survives, and unlinking a
+    // bound socket leaves the listener alive with every later connect() failing.
+    // Detect it and exit, so the locks are released.
+    const boundInode = lstatSync(socketPath).ino;
+    const watchdog = setInterval(() => {
+        let gone = true;
+        try {
+            const st = lstatSync(socketPath);
+            gone = !st.isSocket() || st.ino !== boundInode;
+        } catch {
+            gone = true;
+        }
+        if (gone) {
+            clearInterval(watchdog);
+            log.error(
+                `Listening socket ${socketPath} disappeared; this process is now unreachable. Exiting so the ` +
+                    `session and events locks are released (a runtime directory is removed at logout: ` +
+                    `enable lingering, or set PROTON_WEBDAV_SOCKET somewhere persistent).`,
+            );
+            console.error(`socket ${socketPath} vanished; exiting so locks are released`);
+            void shutdown('socket-lost');
+        }
+    }, 5_000);
+    watchdog.unref?.();
+
     let shuttingDown = false;
     const shutdown = async (signal: string) => {
         if (shuttingDown) {
@@ -199,6 +227,7 @@ async function main(): Promise<void> {
         // stop(false) stops accepting new connections but lets active uploads and
         // downloads finish; forcing them closed would abandon an upload partway
         // and leave a draft behind for no reason.
+        clearInterval(watchdog);
         const drained = server.stop(false);
         const deadline = new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_DRAIN_MS));
         await Promise.race([Promise.resolve(drained), deadline]);
@@ -215,6 +244,8 @@ async function main(): Promise<void> {
     };
     process.on('SIGINT', () => void shutdown('SIGINT'));
     process.on('SIGTERM', () => void shutdown('SIGTERM'));
+    // Closing the controlling terminal must not leave an orphan holding the locks.
+    process.on('SIGHUP', () => void shutdown('SIGHUP'));
 }
 
 main().catch(async (error: unknown) => {
