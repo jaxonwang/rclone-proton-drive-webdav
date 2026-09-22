@@ -63,8 +63,21 @@ rc=$?
 log "rclone exit=$rc"
 
 if [ "$rc" -eq 0 ]; then
-  date -u +%Y-%m-%dT%H:%M:%SZ > "$DONE"
-  log "pass completed with no errors; wrote $DONE"
+  # Exit 0 only means THIS pass's frozen work set is done. rclone fixes that set
+  # when it finishes listing -- which for a large tree happens minutes into a run
+  # that lasts days -- so anything added to the source afterwards is NOT in it.
+  # Writing the marker on exit 0 alone would stop the timer and bury those files
+  # silently. Verify against the LIVE source instead of trusting the exit code.
+  want=$(find "$SRC" -type f | wc -l)
+  got=$(rclone --config "$CONF" size "$DST" --json 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])' 2>/dev/null || echo -1)
+  if [ "$got" = "$want" ]; then
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$DONE"
+    log "pass completed and remote count matches the live source ($got); wrote $DONE"
+  else
+    log "NOT writing $DONE: remote has $got file(s), live source has $want; another pass will run"
+    exit 70
+  fi
 else
   log "pass incomplete (exit $rc); the timer will run again"
 fi

@@ -38,4 +38,14 @@ logout and reboot **without** enabling lingering.
   first", which restarting cannot fix.
 - **A `COMPLETE` marker** stops the timer re-hashing the whole source every
   interval once a pass has finished cleanly. Delete it to force a fresh pass.
+  It is written only when the remote file count matches the **live** source, not
+  merely when rclone exits 0 — see below.
 - **One `flock`** means a copy can never overlap itself; a duplicate exits 73.
+- **Exit 0 is not the same as "everything is backed up."** rclone freezes its work
+  set when it finishes listing, which on a large tree is minutes into a run that
+  lasts days. Files added to the source after that are not in the set, so a pass
+  can legitimately exit 0 with new data un-uploaded. Trusting exit 0 to write the
+  marker would stop the timer and lose them silently. This happened in real use:
+  three files were dropped into the source mid-pass, and the only reason they were
+  not buried is that the marker now requires the remote count to match the live
+  source.
