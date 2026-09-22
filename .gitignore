@@ -1,0 +1,21 @@
+# Build workspace created by scripts/setup.sh: contains an isolated Bun
+# toolchain and a clone of Proton's sources. Never committed.
+workspace/
+
+# Test artifacts
+*.log
+/tmp/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Never commit anything session- or credential-shaped
+auth-session.json
+auth-session.lock
+auth-session.revoked-*.json
+clientUid*.json
+rclone.conf
+*.sock

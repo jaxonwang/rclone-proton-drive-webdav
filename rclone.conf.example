@@ -1,0 +1,16 @@
+# Example rclone remote for the Proton Drive WebDAV service.
+#
+# vendor MUST be nextcloud. With owncloud, rclone advertises MD5 as well as
+# SHA-1, selects MD5 for --checksum, and since Proton has no MD5 the comparison
+# silently verifies nothing.
+#
+# nextcloud_chunk_size MUST be 0: it disables rclone's chunked-upload protocol,
+# which this service does not implement.
+#
+# Requires rclone 1.68.0 or newer (first release with webdav unix_socket).
+[protondrive-sdk]
+type = webdav
+url = http://localhost/
+vendor = nextcloud
+nextcloud_chunk_size = 0
+unix_socket = /run/user/1000/proton-drive-webdav.sock
