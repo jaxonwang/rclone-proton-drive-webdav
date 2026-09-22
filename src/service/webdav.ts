@@ -90,6 +90,12 @@ function xmlText(value: string): string {
 
 function errorToResponse(err: unknown, log?: WebdavOptions['logger']): Response {
     if (err instanceof GatewayError) {
+        // A 5xx is this service's own fault, not the client's. Log it with the
+        // original error so there is a stack to work from; 4xx are expected
+        // outcomes (refusals, conflicts) and would only be noise.
+        if (err.httpStatus >= 500) {
+            log?.error(`Internal failure answering with ${err.httpStatus}: ${err.message}`, err.cause ?? err);
+        }
         // Messages carry paths, which may contain & or <.
         return davResponse(
             err.httpStatus,

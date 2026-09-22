@@ -136,7 +136,7 @@ here because Proton's SHA-1 is intrinsic to the revision. So: degradation below
 git clone <this repo> proton-rclone && cd proton-rclone
 scripts/setup.sh                 # workspace/ : isolated Bun + Proton sources + this service
 cd workspace/sdk/cli
-bash tests/run-all.sh            # 362 checks, no Proton account required
+bash tests/run-all.sh            # 369 checks, no Proton account required
 ```
 
 Then authenticate once with the official CLI, and start the service against the
@@ -219,7 +219,9 @@ is a stock WebDAV remote, but they are not exercised here.
    and a foreign-draft `409` refused and then authorised for one exact path. A
    full recursive inventory of ~1,500 files took 22 s. What is *not* established
    is long-run behaviour: multi-day transfers, token refresh over many hours, and
-   recovery from a real power loss are still unproven.
+   recovery from a real power loss are still unproven. Live use immediately found
+   two defects no offline test could reach: the small-file upload path, which only
+   exists behind a production feature flag, and rclone's default request timeout.
 2. **One Proton client at a time per data directory.** Two would share a
    rotating refresh token. The service also shares that directory's log and
    SQLite caches with the CLI.
@@ -403,6 +405,45 @@ another client" precisely when the draft *is* its own. The message now states
 that it may be our own draft, puts retrying first, and makes the override
 conditional.
 
+### Bun's `releaseLock()` broke every small upload, and hid why
+
+The SDK has a second upload path for small files: one request instead of a
+draft plus blocks, taken when the ciphertext would be under 128 KiB (about
+116 KiB of plaintext, after a 10% margin). It reads the whole body with
+`readStreamToUint8Array`, which calls `reader.releaseLock()` in a `finally`.
+
+Against a Bun request body, inside this service, that call throws
+`undefined is not a function` — while `typeof reader.releaseLock === 'function'`
+is true, and the same code against the same kind of stream in a minimal Bun
+server works. Every file under ~116 KiB therefore failed with an opaque
+`500 Internal error: undefined is not a function`. Because the throw happened in
+a `finally`, it also replaced the real outcome: the body had been read correctly,
+all 17 bytes of the probe, and the error named nothing useful.
+
+The gateway now hands the SDK a `ReadableStream` it constructs itself, so
+`getReader`/`releaseLock` are the standard implementations rather than the broken
+native path. It is a pass-through, not a buffer — `pull` reads one chunk on
+demand — so backpressure and memory behaviour are unchanged for large files.
+
+Two things made this invisible until live use. The test double read the stream
+but never called `releaseLock()`, so it could not fail the way the real SDK does;
+it now calls it in a `finally`, exactly as the SDK's path does. And the small-file
+path only exists when the `DriveSmallFileUpload` feature flag is on, which is a
+production-only code path no in-memory fake reaches.
+
+Diagnosing it also exposed that a `GatewayError` answered as `5xx` was logged
+without the original error, so an internal bug arrived as a message with no
+stack. 5xx now logs the cause; 4xx stays quiet, because refusals are expected.
+
+### The request body leaked when the SDK refused before reading it
+
+Found by the regression test for the above. Every early rejection in `put()`
+cancels the request body, but a rejection from `getFileUploader` itself — which
+is what a foreign draft produces — skipped that, leaving the connection half-read
+with the client waiting on a stream nobody reads. The body is now wrapped before
+the uploader is requested, and released on any failure, via the source reader
+directly so it works even once the SDK holds a lock on the wrapper.
+
 ### rclone's default timeout makes large uploads impossible, silently
 
 The default `--timeout 5m` is described as an IO idle timeout, which sounds
@@ -447,14 +488,14 @@ Network failures are injected inside an in-memory gateway.
 $ bash tests/run-all.sh
   typecheck clean
 SUITE: webdav-protocol  RESULT:  97 passed, 0 failed
-SUITE: sdk-gateway      RESULT: 105 passed, 0 failed
+SUITE: sdk-gateway      RESULT: 112 passed, 0 failed
 SUITE: session          RESULT:  72 passed, 0 failed
 SUITE: rclone-smoke     RESULT:  20 passed, 0 failed
 SUITE: rclone-faults    RESULT:  29 passed, 0 failed
 SUITE: rclone-mount     RESULT:  15 passed, 0 failed
 SUITE: wire             RESULT:   8 passed, 0 failed
 SUITE: reboot-resume    RESULT:  16 passed, 0 failed
-TOTAL: 362 passed, 0 failed across 8 suites
+TOTAL: 369 passed, 0 failed across 8 suites
 ```
 
 | Suite | What it drives |

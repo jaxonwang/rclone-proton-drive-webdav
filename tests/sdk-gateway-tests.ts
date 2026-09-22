@@ -81,6 +81,8 @@ class FakeDrive {
      * is indistinguishable from another client's draft at the type level.
      */
     failDeleteDraftOnce = false;
+    /** The stream the SDK was actually handed on the last upload. */
+    lastUploadStream?: ReadableStream<Uint8Array>;
     lastUploadMetadata?: Record<string, unknown>;
     lastUploadSignal?: AbortSignal;
     /** set to throw from the next download BEFORE any byte, leaving the writer locked as the SDK does */
@@ -313,14 +315,24 @@ class FakeDrive {
         const drive = this;
         return {
             async uploadFromStream(stream: ReadableStream<Uint8Array>) {
+                // Recorded so tests can assert the gateway does not hand the SDK
+                // the request body object itself; see ownedStream in sdkGateway.
+                drive.lastUploadStream = stream;
                 const reader = stream.getReader();
                 const chunks: Uint8Array[] = [];
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) {
-                        break;
+                try {
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) {
+                            break;
+                        }
+                        chunks.push(value);
                     }
-                    chunks.push(value);
+                } finally {
+                    // The real SDK's small-file path does exactly this, in a
+                    // finally, via readStreamToUint8Array. Omitting it here is why
+                    // a releaseLock that throws went unnoticed until live use.
+                    reader.releaseLock();
                 }
                 const total = chunks.reduce((n, c) => n + c.byteLength, 0);
                 const data = new Uint8Array(total);
@@ -638,6 +650,64 @@ console.log('\n-- a transient failure deleting our OWN draft must not be blamed 
     const retried = await gw.put('/mine.bin', bodyOf('recovered'), { sha1: sha1(enc.encode('recovered')), size: 9, immutable: true });
     check('the recommended retry recovers the own draft', retried.kind === 'created', retried.kind);
     check('recovery used deleteDraft, never trash or bulk delete', drive.calls.some((c) => c.startsWith('deleteDraft ')) && !drive.calls.some((c) => c.startsWith('trashNodes') || c.startsWith('deleteNodes')));
+}
+
+console.log('\n-- the SDK is handed a stream we own, not the request body --');
+{
+    // Bun's request-body reader has a releaseLock() that exists but throws
+    // "undefined is not a function" inside this service. The SDK's small-file path
+    // calls it in a finally, so every small upload failed with an opaque 500 even
+    // though the bytes had been read correctly. The gateway therefore re-wraps the
+    // body. These checks pin the wrapper's behaviour; the Bun defect itself cannot
+    // be reproduced in-process.
+    const drive = new FakeDrive('sdk-js-cli-test');
+    const gw = makeGateway(drive);
+
+    const payload = 'small file content';
+    const source = bodyOf(payload);
+    const res = await gw.put('/small.txt', source, { sha1: sha1(enc.encode(payload)), size: payload.length, immutable: true });
+    check('a small upload still succeeds end to end', res.kind === 'created', res.kind);
+    check('the SDK was NOT handed the request body object itself', drive.lastUploadStream !== undefined && drive.lastUploadStream !== source);
+    check('every byte still arrived intact', new TextDecoder().decode(drive.nodes.get([...drive.nodes.values()].find((n) => n.name === 'small.txt')!.uid)!.content!) === payload);
+
+    // releaseLock on the wrapper must be safe: the double now calls it the way the
+    // real SDK does, so a wrapper that forwarded to the broken reader would fail
+    // this whole block.
+    check('the upload completed without a releaseLock failure', drive.calls.some((c) => c.startsWith('getFileUploader')));
+
+    // Cancellation must reach the underlying body, or a client that disappears
+    // leaves the connection half-read.
+    {
+        let cancelled: unknown = 'not cancelled';
+        const src = new ReadableStream<Uint8Array>({
+            start(c) { c.enqueue(enc.encode('abc')); },
+            cancel(reason) { cancelled = reason; },
+        });
+        const drive2 = new FakeDrive('sdk-js-cli-test');
+        drive2.addDraft('busy.bin', 'sdk-js-cli-OTHER');
+        const gw2 = makeGateway(drive2);
+        // Refused for a foreign draft, which is one of the paths that must still
+        // release the body rather than leave it dangling.
+        await gw2.put('/busy.bin', src, { sha1: sha1(enc.encode('abc')), size: 3, immutable: true }).catch(() => {});
+        check('a refused upload cancels the source body', cancelled !== 'not cancelled', String(cancelled));
+    }
+
+    // An error from the source must surface, not be swallowed into a short upload.
+    {
+        const drive3 = new FakeDrive('sdk-js-cli-test');
+        const gw3 = makeGateway(drive3);
+        const boom = new Error('source exploded');
+        const failing = new ReadableStream<Uint8Array>({
+            start(c) { c.enqueue(enc.encode('partial')); },
+            pull(c) { c.error(boom); },
+        });
+        let caught: unknown;
+        try {
+            await gw3.put('/broken.bin', failing, { size: 99, immutable: true });
+        } catch (e) { caught = e; }
+        check('a source-stream error fails the upload instead of truncating it', caught !== undefined);
+        check('nothing was committed from the failed stream', !([...drive3.nodes.values()].some((n) => n.name === 'broken.bin' && n.revision)));
+    }
 }
 
 console.log('\n-- deletion is trash, never permanent delete --');

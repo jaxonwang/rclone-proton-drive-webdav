@@ -714,6 +714,12 @@ export class SdkGateway implements DriveGateway {
             this.logger.warn(`Explicit consent active: another client's unfinished draft at ${p} may be replaced`);
         }
 
+        // See ownedStream: a Bun request body breaks the SDK's small-file path.
+        // Wrapped before the uploader is requested, so the body can still be
+        // released if that request is the thing that fails -- getFileUploader
+        // rejects outright for a foreign draft, and the SDK never touches the
+        // stream in that case.
+        const upstream = ownedStream(body);
         try {
             // The signal matters more than it looks: the SDK takes a concurrency
             // permit inside these calls and waiting for one has no timeout, so
@@ -722,11 +728,12 @@ export class SdkGateway implements DriveGateway {
             const uploader = revisionOfUid
                 ? await this.sdk.getFileRevisionUploader(revisionOfUid, metadata, opts.signal)
                 : await this.sdk.getFileUploader(parent, name, metadata, opts.signal);
-            const controller = await uploader.uploadFromStream(body, []);
+            const controller = await uploader.uploadFromStream(upstream.stream, []);
             await controller.completion();
             this.invalidate(p);
             return revisionOfUid ? { kind: 'updated' } : { kind: 'created' };
         } catch (error: unknown) {
+            await upstream.release();
             this.invalidate(p);
             throw mapUploadError(error, p);
         }
@@ -904,6 +911,63 @@ async function forceReleaseDownloadSlot(downloader: { downloadToStream: (s: Writ
     }
 }
 
+/**
+ * Re-wrap a request body in a ReadableStream this process owns.
+ *
+ * Bun's request-body reader has a `releaseLock` that exists but throws
+ * "undefined is not a function" when called inside this service, though not in a
+ * minimal Bun server. The SDK's small-file path (single request, under ~116 KiB
+ * of ciphertext) reads the whole body with `readStreamToUint8Array`, which calls
+ * `releaseLock()` in a `finally` -- so every small upload failed with a 500 even
+ * though the bytes had been read correctly. Worse, the `finally` masked the
+ * original outcome, which is why the error named no useful cause.
+ *
+ * Handing the SDK a stream constructed here sidesteps the broken native call
+ * entirely: `getReader`/`releaseLock` are then the standard implementations. It
+ * is a pass-through, not a buffer -- `pull` reads exactly one chunk on demand, so
+ * backpressure and memory behaviour are unchanged, which matters because the same
+ * path carries multi-gigabyte files. Cancellation is forwarded so a client that
+ * disappears still releases the underlying body.
+ *
+ * Deliberately never calls releaseLock() on the source reader: that is the broken
+ * call being avoided.
+ */
+function ownedStream(src: ReadableStream<Uint8Array>): {
+    stream: ReadableStream<Uint8Array>;
+    /**
+     * Release the underlying body, whatever state the wrapper is in.
+     *
+     * Cancelling the wrapper is not enough: once the SDK has taken a reader on it,
+     * `wrapper.cancel()` throws because the stream is locked, and the request body
+     * would be left half-read with the client waiting on a stream nobody reads.
+     * Cancelling the source reader directly always works.
+     */
+    release: () => Promise<void>;
+} {
+    const reader = src.getReader();
+    const release = async () => {
+        await reader.cancel().catch(() => {});
+    };
+    const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            try {
+                const { done, value } = await reader.read();
+                if (done) {
+                    controller.close();
+                    return;
+                }
+                controller.enqueue(value);
+            } catch (error: unknown) {
+                controller.error(error);
+            }
+        },
+        cancel(reason: unknown) {
+            return reader.cancel(reason);
+        },
+    });
+    return { stream, release };
+}
+
 /** Mirror an incoming signal onto an internal controller, without leaking a listener. */
 function linkAbort(source: AbortSignal | undefined, target: AbortController): void {
     if (!source) {
@@ -967,5 +1031,7 @@ function mapGenericError(error: unknown): GatewayError {
         return new GatewayError(error.message, 422);
     }
     const message = error instanceof Error ? error.message : String(error);
-    return new GatewayError(`Internal error: ${message}`, 500);
+    // Carry the original so the HTTP layer can log a stack: a 500 here is a bug
+    // in this service, and the message alone is usually not enough to locate it.
+    return new GatewayError(`Internal error: ${message}`, 500, error);
 }

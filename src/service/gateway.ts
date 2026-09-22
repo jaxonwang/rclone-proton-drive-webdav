@@ -66,13 +66,24 @@ export type PutResult =
     | { kind: 'skipped-identical' }; // existing file already had identical content (SHA-1)
 
 export class GatewayError extends Error {
-    constructor(
-        message: string,
-        readonly httpStatus: number,
-    ) {
+    /**
+     * The error this was mapped from, when there is one.
+     *
+     * A 5xx GatewayError means an internal bug, and the mapped message alone is
+     * rarely enough to find it: "undefined is not a function" with no stack cost
+     * real time to diagnose against live Proton. Keeping the original lets the
+     * HTTP layer log a stack for anything it is about to answer 5xx.
+     */
+    readonly cause?: unknown;
+
+    constructor(message: string, httpStatus: number, cause?: unknown) {
         super(message);
+        this.httpStatus = httpStatus;
+        this.cause = cause;
         this.name = 'GatewayError';
     }
+
+    readonly httpStatus: number;
 }
 
 /** Path does not exist. Maps to 404. */
