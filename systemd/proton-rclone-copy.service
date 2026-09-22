@@ -1,0 +1,15 @@
+[Unit]
+Description=Copy a tree to Proton Drive through the WebDAV bridge
+Requires=proton-rclone-bridge.service
+After=proton-rclone-bridge.service
+
+[Service]
+Type=oneshot
+User=YOURUSER
+Environment=HOME=/home/YOURUSER
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# One exclusive lock, so a pass can never overlap itself. Exit 73 = already held.
+ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 73 /home/YOURUSER/.local/state/proton-rclone/copy.lock /home/YOURUSER/.local/state/proton-rclone/copy.sh
+# A slow link plus large files means a pass legitimately runs for many hours.
+TimeoutStartSec=infinity
+UMask=0077

@@ -1,0 +1,28 @@
+[Unit]
+Description=Proton Drive WebDAV bridge (external-drive-rclone)
+
+[Service]
+Type=exec
+User=YOURUSER
+WorkingDirectory=/home/YOURUSER/proton-rclone/workspace/sdk/cli
+Environment=HOME=/home/YOURUSER
+Environment=PATH=/home/YOURUSER/proton-rclone/workspace/tools/bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PROTON_DRIVE_CACHE_DIR=/home/YOURUSER/.local/state/proton-drive-cli
+# unsafe_file avoids an OS keyring that no background process can unlock.
+Environment=PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file
+Environment=PROTON_DRIVE_LOG_LEVEL=INFO
+# A persistent path, NOT $XDG_RUNTIME_DIR, which is removed at last logout.
+Environment=PROTON_WEBDAV_SOCKET=/home/YOURUSER/.local/state/proton-rclone/dav.sock
+Environment=PROTON_WEBDAV_ROOT=/my-files
+Environment=PROTON_WEBDAV_IMMUTABLE=1
+# PROTON_WEBDAV_OVERRIDE_DRAFT_PATH is deliberately absent: replacing another
+# client's unfinished upload must be a per-path, per-incident decision.
+ExecStart=/home/YOURUSER/proton-rclone/workspace/tools/bun/bin/bun run src/service/serve.ts
+Restart=on-failure
+RestartSec=30
+# Exit 3 is "authenticate first"; restarting cannot fix it.
+RestartPreventExitStatus=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

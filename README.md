@@ -93,6 +93,31 @@ chunked-upload protocol, which this service does not implement, and it avoids
 rclone's chunk-URL probe that fails against a non-Nextcloud URL layout. Expect
 one `NOTICE: Chunked uploads are disabled...` line per invocation.
 
+**`--timeout 0` is required for large files.** This is the one flag you cannot
+leave at its default. A WebDAV `PUT` receives its status only after Proton has
+committed the revision, so the whole upload happens inside one request. rclone's
+default `--timeout 5m` is an *idle* timeout on that request, and it fires long
+before a large file finishes on a slow link:
+
+```
+ERROR : big.mp4: Failed to copy: ... 5m00s
+ERROR : big.mp4: Failed to copy: ... 5m00s      <- every attempt, exactly 5m
+```
+
+Measured: a 406 MB file failed on every attempt at exactly 5m00s, then succeeded
+on the first try in 7m00s with `--timeout 0`, committing with the expected SHA-1.
+At ~1 MB/s that threshold is about 300 MB, so it is not an edge case. Each failed
+attempt also re-sends the entire file, because there is no byte-level resume —
+and `--low-level-retries` multiplies those whole-file re-sends, so keep it at 1
+rather than the default 10.
+
+```bash
+rclone copy ~/media protondrive-sdk:media --checksum --immutable   --transfers 1 --retries 2 --low-level-retries 1 --timeout 0
+```
+
+The cost of `--timeout 0` is that a genuinely wedged transfer will not self-heal.
+Use `--stats` so a stall is visible.
+
 **rclone 1.68.0 minimum, 1.75.1 recommended.** Established by fetching
 `backend/webdav/webdav.go` at every tag from v1.62.0 to v1.75.1: `unix_socket`
 first appears in v1.68.0. Every nextcloud quirk this relies on (`hasOCSHA1`,
@@ -188,9 +213,13 @@ is a stock WebDAV remote, but they are not exercised here.
 
 ## Limitations
 
-1. **Not yet exercised against live Proton.** The SDK gateway is covered by
-   contract tests against a `ProtonDriveClient` double, and the session layer
-   against a mock Proton API. Treat first real use as a read-only trial.
+1. **Exercised against live Proton, but not long-proven.** A read-only trial and
+   a real upload have now run against a live account: quota, recursive listing
+   with SHA-1 for every file, a 406 MB upload committed with the expected digest,
+   and a foreign-draft `409` refused and then authorised for one exact path. A
+   full recursive inventory of ~1,500 files took 22 s. What is *not* established
+   is long-run behaviour: multi-day transfers, token refresh over many hours, and
+   recovery from a real power loss are still unproven.
 2. **One Proton client at a time per data directory.** Two would share a
    rotating refresh token. The service also shares that directory's log and
    SQLite caches with the CLI.
@@ -198,30 +227,34 @@ is a stock WebDAV remote, but they are not exercised here.
    inside the revision, so `rclone touch` fails. Times set during upload are kept
    exactly. Prefer `--checksum` for comparisons: a skipped file keeps its old
    remote timestamp, so a size+mtime comparison may keep re-offering it.
-4. **No streaming uploads of unknown size**, so `rclone rcat` will not work.
+4. **Large uploads need `--timeout 0`**, because a `PUT` is answered only after
+   Proton commits and rclone's default idle timeout is 5 minutes. See above; this
+   bites at roughly 300 MB on a 1 MB/s link.
+5. **No streaming uploads of unknown size**, so `rclone rcat` will not work.
    `copy`, `sync` and `mount` all supply a size.
-5. **Server-side directory copy is unsupported** (`501`); rclone falls back to
+6. **Server-side directory copy is unsupported** (`501`); rclone falls back to
    per-file copies.
-6. **Mount writes report failures asynchronously.** With `--vfs-cache-mode full`
+7. **Mount writes report failures asynchronously.** With `--vfs-cache-mode full`
    the local write and close succeed and the upload happens later, so a refusal
    appears in the rclone log rather than as an error to the writing program, and
    the file stays in the VFS cache and is retried. Use a dedicated `--cache-dir`.
-7. **Files are skipped, with a warning, when Proton cannot decrypt the name** or
+8. **Files are skipped, with a warning, when Proton cannot decrypt the name** or
    when the revision reports no clear-text size. Reporting size `0` would make
    rclone copy such a file as empty and call it done.
-8. **SHA-1 only.** Proton has no MD5. Files whose revision carries no digest
+9. **SHA-1 only.** Proton has no MD5. Files whose revision carries no digest
    expose no hash, and none is ever fabricated. Be aware of what that means for
    verification: `rclone check --checksum` reports such a file as matching, on
    size alone, with exit 0. That is the same output shape as the `vendor = owncloud`
    trap described above, so treat "0 differences" as conditional on the remote
    actually having digests.
-9. **No systemd unit and no auto-restart.** It does not survive logout or reboot.
-   The default socket lives under `$XDG_RUNTIME_DIR`, which the system removes at
-   last logout; the process would then still be running but unreachable, so it
-   watches its own socket and exits if it disappears, releasing its locks. For an
-   unattended long-running job, either enable lingering for the user or put the
-   socket somewhere persistent.
-10. **Photos, albums, sharing and trash browsing are not exposed.** One Drive
+10. **Not a managed daemon.** The service itself does not survive logout or
+    reboot, and does not restart itself. The default socket lives under
+    `$XDG_RUNTIME_DIR`, which the system removes at last logout; the process would
+    then still be running but unreachable, so it watches its own socket and exits
+    if it disappears, releasing its locks. `systemd/` has working example units
+    that supply the missing lifecycle — including the detail that the *timer*, not
+    `--retries`, is what makes a long copy survive a reboot.
+11. **Photos, albums, sharing and trash browsing are not exposed.** One Drive
     subtree is served.
 
 ---
@@ -370,6 +403,21 @@ another client" precisely when the draft *is* its own. The message now states
 that it may be our own draft, puts retrying first, and makes the override
 conditional.
 
+### rclone's default timeout makes large uploads impossible, silently
+
+The default `--timeout 5m` is described as an IO idle timeout, which sounds
+harmless for a transfer that is actively moving bytes. It is not, here: the
+status of a `PUT` is only available after Proton commits, so the request outlives
+the entire upload. On a ~1 MB/s link every attempt at a 406 MB file died at
+exactly 5m00s, with a "Failed to copy" that names a timeout rather than anything
+suggesting a configuration problem — and because there is no byte-level resume,
+each attempt re-sent the whole file first. With `--timeout 0` the same file
+uploaded once, in 7m00s, and committed with the expected SHA-1.
+
+Nothing on the server side can fix this: a `PUT` has exactly one response, and
+sending it before the commit would be the "report success before Proton confirms"
+failure this project exists to avoid.
+
 ### Smaller ones
 
 - A single-writer lock that exempted its own PID would steal its own lock; the
@@ -454,6 +502,7 @@ src/service/
   serveMock.ts        test entry point (+ control socket)
 tests/                eight suites; run-all.sh runs them and prints one summary
 scripts/setup.sh      builds the workspace: Bun + Proton sources + this service
+systemd/              example units for an unattended long-running backup
 ```
 
 The WebDAV layer depends only on `gateway.ts`, never on the SDK, which is what

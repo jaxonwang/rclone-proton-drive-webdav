@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep resuming the Proton Drive copy until a pass completes cleanly
+
+[Timer]
+# This, not --retries, is what makes the job survive a reboot.
+OnBootSec=3min
+OnUnitInactiveSec=20min
+Persistent=true
+AccuracySec=30s
+Unit=proton-rclone-copy.service
+
+[Install]
+WantedBy=timers.target
