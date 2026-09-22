@@ -12,7 +12,7 @@
  *   /snapshot    -> {tree, calls}
  *   /reset-calls
  */
-import { chmodSync, existsSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 
 import { MockGateway } from './mockGateway';
 import { OverwriteGuard } from './overwriteGuard';
@@ -28,8 +28,23 @@ const controlPath = arg('control', '/tmp/proton-webdav-mock-ctl.sock')!;
 const immutable = (arg('immutable', '1') ?? '1') !== '0';
 const overrideDraftPath = arg('override-draft-path');
 const clientUid = arg('client-uid', 'sdk-js-cli-mock')!;
+// --state persists the remote tree across restarts, so a simulated reboot keeps
+// committed files AND drafts, the way Proton would.
+const statePath = arg('state');
 
 const gateway = new MockGateway(clientUid);
+if (statePath && existsSync(statePath)) {
+    gateway.restore(readFileSync(statePath, 'utf8'));
+}
+const persist = () => {
+    if (statePath) {
+        try {
+            writeFileSync(statePath, gateway.serialize(), { mode: 0o600 });
+        } catch (error) {
+            console.error('[dav] could not persist state', error);
+        }
+    }
+};
 const guard = new OverwriteGuard();
 const logger = {
     debug: (m: string) => {
@@ -55,9 +70,18 @@ process.on('unhandledRejection', (reason) => console.error('[dav] unhandled reje
 const dav = Bun.serve({
     unix: socketPath,
     maxRequestBodySize: Number.MAX_SAFE_INTEGER,
-    fetch: (req, srv) => {
+    fetch: async (req, srv) => {
         srv.timeout(req, 0);
-        return handleRequest(req, gateway, { immutable, allowOverrideDraftForPath: overrideDraftPath, logger, guard });
+        const method = req.method.toUpperCase();
+        try {
+            return await handleRequest(req, gateway, { immutable, allowOverrideDraftForPath: overrideDraftPath, logger, guard });
+        } finally {
+            // Persist after anything that can change the tree, including a FAILED
+            // upload: that is exactly when a draft is left behind.
+            if (method !== 'GET' && method !== 'HEAD' && method !== 'PROPFIND' && method !== 'OPTIONS') {
+                persist();
+            }
+        }
     },
     error: (err) => {
         logger.error('HTTP handler crashed', err);
@@ -71,24 +95,33 @@ const control = Bun.serve({
     fetch: async (req) => {
         const url = new URL(req.url);
         const body = req.method === 'POST' ? ((await req.json().catch(() => ({}))) as Record<string, unknown>) : {};
+        let persistAfter = false;
         switch (url.pathname) {
             case '/seed-file':
+                persistAfter = true;
                 gateway.seedFile(
                     String(body.path),
                     String(body.content ?? ''),
                     body.mtime ? new Date(String(body.mtime)) : undefined,
                 );
+                if (persistAfter) {
+                    persist();
+                }
                 return Response.json({ ok: true });
             case '/seed-draft':
                 gateway.seedDraft(String(body.path), String(body.clientUid));
+                persist();
                 return Response.json({ ok: true });
             case '/faults':
                 Object.assign(gateway.faults, body);
                 return Response.json({ ok: true, faults: gateway.faults });
             case '/snapshot':
-                return Response.json({ tree: gateway.snapshot(), calls: gateway.calls });
+                return Response.json({ tree: gateway.snapshot(), calls: gateway.calls, putBytes: gateway.putBytes });
             case '/reset-calls':
                 gateway.calls.length = 0;
+                for (const key of Object.keys(gateway.putBytes)) {
+                    delete gateway.putBytes[key];
+                }
                 return Response.json({ ok: true });
             default:
                 return new Response('unknown control endpoint', { status: 404 });

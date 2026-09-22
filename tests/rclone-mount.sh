@@ -17,6 +17,7 @@ cleanup() {
   if mountpoint -q "$T/mnt" 2>/dev/null; then fusermount3 -u "$T/mnt" 2>/dev/null || true; fi
   [ -n "$MOUNT_PID" ] && kill "$MOUNT_PID" 2>/dev/null
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null
+  for p in $(pgrep -f -- "$T/dav.sock" 2>/dev/null); do [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null; done
   return 0
 }
 trap cleanup EXIT

@@ -15,7 +15,16 @@ T="${1:-/tmp/pdrclone-wire}"
 rm -rf "$T"; mkdir -p "$T"
 export PATH="$CLI_DIR/../../tools/bun/bin:$PATH"
 
-cleanup() { [ -f "$T/mock.pid" ] && kill "$(cat "$T/mock.pid")" 2>/dev/null; return 0; }
+# `bun run` forks a child that does not die with its parent, so killing only the
+# tracked PID leaks one service process per boot. Also reap anything still bound
+# to this suite's socket, which is unique to its temp dir.
+reap_sockets() {
+  for p in $(pgrep -f -- "$T/dav.sock" 2>/dev/null); do
+    [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null
+  done
+  return 0
+}
+cleanup() { [ -f "$T/mock.pid" ] && kill "$(cat "$T/mock.pid")" 2>/dev/null; reap_sockets; }
 trap cleanup EXIT
 
 ( cd "$CLI_DIR" && bun run src/service/serveMock.ts --socket "$T/dav.sock" --control "$T/ctl.sock" > "$T/mock.log" 2>&1 & echo $! > "$T/mock.pid" )

@@ -111,7 +111,7 @@ here because Proton's SHA-1 is intrinsic to the revision. So: degradation below
 git clone <this repo> proton-rclone && cd proton-rclone
 scripts/setup.sh                 # workspace/ : isolated Bun + Proton sources + this service
 cd workspace/sdk/cli
-bash tests/run-all.sh            # 308 checks, no Proton account required
+bash tests/run-all.sh            # 324 checks, no Proton account required
 ```
 
 Then authenticate once with the official CLI, and start the service against the
@@ -161,8 +161,13 @@ is a stock WebDAV remote, but they are not exercised here.
 
 - **Uploads are confirmed, not assumed.** Success is reported only after Proton
   commits the revision.
-- **Interrupted uploads resume.** An interruption commits nothing and leaves a
-  Proton draft; retrying reuses it.
+- **Interrupted uploads recover, but do not resume byte-wise.** An interruption
+  commits nothing and leaves a Proton draft, which is invisible to listings, so a
+  partial upload can never be mistaken for a complete file. Rerunning the same
+  command completes it correctly — but it re-sends the whole file from byte zero,
+  because the SDK replaces its own stale draft rather than continuing it. Measured:
+  a 3,000,000-byte file interrupted after 913,408 bytes cost 3,000,000 bytes on the
+  retry. Budget for that on a large file over a bad link.
 - **Existing content is protected by default.** Identical content is skipped
   without transferring; differing content is refused rather than overwritten.
   Set `PROTON_WEBDAV_IMMUTABLE=0` for new revisions instead (Proton keeps the
@@ -341,7 +346,8 @@ SUITE: rclone-smoke     RESULT: 20 passed, 0 failed
 SUITE: rclone-faults    RESULT: 26 passed, 0 failed
 SUITE: rclone-mount     RESULT: 15 passed, 0 failed
 SUITE: wire             RESULT:  8 passed, 0 failed
-TOTAL: 308 passed, 0 failed across 7 suites
+SUITE: reboot-resume    RESULT: 16 passed, 0 failed
+TOTAL: 324 passed, 0 failed across 8 suites
 ```
 
 | Suite | What it drives |
@@ -353,6 +359,7 @@ TOTAL: 308 passed, 0 failed across 7 suites
 | `rclone-faults.sh` | interrupted transfers, drafts, consent scoping, retries, revoked session |
 | `rclone-mount.sh` | FUSE mount: listing, reads, kernel ranged reads, writes, immutability |
 | `wire-tests.sh` | raw socket: how failures are actually framed on the wire |
+| `reboot-resume.sh` | a mid-transfer crash, then the same command rerun against the surviving remote state |
 
 Covered explicitly: interrupted uploads, own-draft recovery, another client's
 draft, scoped consent, process restart, token refresh and persistence,
@@ -386,7 +393,7 @@ src/service/
   mockGateway.ts      in-memory double with fault injection (tests only)
   serve.ts            production entry point (Unix socket)
   serveMock.ts        test entry point (+ control socket)
-tests/                six suites; run-all.sh runs them and prints one summary
+tests/                eight suites; run-all.sh runs them and prints one summary
 scripts/setup.sh      builds the workspace: Bun + Proton sources + this service
 ```
 

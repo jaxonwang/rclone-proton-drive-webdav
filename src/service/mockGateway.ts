@@ -59,6 +59,13 @@ export class MockGateway implements DriveGateway {
     readonly faults: Faults = { transientFailures: 0, sessionRevoked: false };
     /** Log of gateway calls, for assertions. */
     readonly calls: string[] = [];
+    /**
+     * Body bytes actually received per path, cumulative. This is what settles
+     * whether a retried upload resumed from an offset or re-sent the whole file:
+     * WebDAV PUT has no range semantics, so the server can only be told the
+     * complete body, but measuring beats reasoning.
+     */
+    readonly putBytes: Record<string, number> = {};
     usedBytes = 0;
 
     constructor(readonly clientUid: string = 'sdk-js-cli-mock') {}
@@ -265,6 +272,7 @@ export class MockGateway implements DriveGateway {
                 chunks.push(value);
                 hash.update(value);
                 draft.receivedBytes += value.byteLength;
+                this.putBytes[p] = (this.putBytes[p] ?? 0) + value.byteLength;
                 if (drop !== undefined && draft.receivedBytes >= drop) {
                     throw new GatewayError('Simulated connection drop during upload', 599);
                 }
@@ -402,6 +410,72 @@ export class MockGateway implements DriveGateway {
             }
             node = next;
         }
+    }
+
+    /**
+     * Serialise the whole tree, drafts included.
+     *
+     * Drafts have to survive because that is what makes a reboot test meaningful:
+     * an interrupted upload leaves a draft on Proton, and Proton does not forget
+     * it just because the client died.
+     */
+    serialize(): string {
+        const files: Record<string, { data: string; sha1: string; mtime: string; revisions: number }> = {};
+        const dirs: string[] = [];
+        const drafts: Record<string, { clientUid: string; receivedBytes: number }> = {};
+        const walk = (dir: MockDir, prefix: string) => {
+            for (const [name, node] of dir.children) {
+                const p = normalize(prefix + '/' + name);
+                if (node.kind === 'dir') {
+                    dirs.push(p);
+                    walk(node, p);
+                } else if (node.kind === 'file') {
+                    files[p] = {
+                        data: Buffer.from(node.data).toString('base64'),
+                        sha1: node.sha1,
+                        mtime: node.mtime.toISOString(),
+                        revisions: node.revisions,
+                    };
+                } else {
+                    drafts[p] = { clientUid: node.clientUid, receivedBytes: node.receivedBytes };
+                }
+            }
+        };
+        walk(this.root, '');
+        return JSON.stringify({ dirs, files, drafts, usedBytes: this.usedBytes }, null, 2);
+    }
+
+    /** Restore a tree produced by serialize(). */
+    restore(json: string): void {
+        const parsed = JSON.parse(json) as {
+            dirs?: string[];
+            files?: Record<string, { data: string; sha1: string; mtime: string; revisions: number }>;
+            drafts?: Record<string, { clientUid: string; receivedBytes: number }>;
+            usedBytes?: number;
+        };
+        this.root.children.clear();
+        for (const d of parsed.dirs ?? []) {
+            this.ensureDirs(d);
+        }
+        for (const [p, f] of Object.entries(parsed.files ?? {})) {
+            this.ensureDirs(parentPath(p));
+            this.dirOf(p).children.set(baseName(p), {
+                kind: 'file',
+                data: new Uint8Array(Buffer.from(f.data, 'base64')),
+                sha1: f.sha1,
+                mtime: new Date(f.mtime),
+                revisions: f.revisions,
+            });
+        }
+        for (const [p, d] of Object.entries(parsed.drafts ?? {})) {
+            this.ensureDirs(parentPath(p));
+            this.dirOf(p).children.set(baseName(p), {
+                kind: 'draft',
+                clientUid: d.clientUid,
+                receivedBytes: d.receivedBytes,
+            });
+        }
+        this.usedBytes = parsed.usedBytes ?? 0;
     }
 
     /** Snapshot for assertions: path -> {sha1,size,revisions} or 'dir'/'draft:<uid>'. */

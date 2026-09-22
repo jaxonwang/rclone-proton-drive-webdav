@@ -22,7 +22,16 @@ start_mock() {
   for _ in $(seq 1 100); do [ -S "$T/dav.sock" ] && return 0; sleep 0.1; done
   echo "mock did not start"; cat "$T/mock.log"; exit 1
 }
-stop_mock() { [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null; rm -f "$T/dav.sock" "$T/ctl.sock"; sleep 0.2; }
+# `bun run` forks a child that does not die with its parent, so killing only the
+# tracked PID leaks one service process per boot. Also reap anything still bound
+# to this suite's socket, which is unique to its temp dir.
+reap_sockets() {
+  for p in $(pgrep -f -- "$T/dav.sock" 2>/dev/null); do
+    [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null
+  done
+  return 0
+}
+stop_mock() { [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null; reap_sockets; rm -f "$T/dav.sock" "$T/ctl.sock"; sleep 0.2; }
 trap stop_mock EXIT
 
 ctl()      { curl -s --unix-socket "$T/ctl.sock" -X POST -H 'content-type: application/json' -d "$2" "http://localhost$1" >/dev/null; }
